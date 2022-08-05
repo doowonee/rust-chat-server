@@ -1,2 +1,2 @@
 # rust-chat-server
-proof of concept chat server in rust
+Proof of concept chat server in rust
