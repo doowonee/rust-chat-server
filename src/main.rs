@@ -6,6 +6,8 @@
 //! cd examples && cargo run -p example-chat
 //! ```
 
+mod error;
+
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -14,6 +16,10 @@ use axum::{
     response::{Html, IntoResponse},
     routing::get,
     Router,
+};
+use fred::{
+    prelude::*,
+    types::{ReconnectPolicy, RedisConfig},
 };
 use futures::{sink::SinkExt, stream::StreamExt};
 use std::{
@@ -28,6 +34,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 struct AppState {
     user_set: Mutex<HashSet<String>>,
     tx: broadcast::Sender<String>,
+    redis: RedisClient,
 }
 
 #[tokio::main]
@@ -39,10 +46,24 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // 서버 내부 메모리 에서 유저풀 관리
     let user_set = Mutex::new(HashSet::new());
     let (tx, _rx) = broadcast::channel(100);
 
-    let app_state = Arc::new(AppState { user_set, tx });
+    // Redis 클라이언트 준비
+    let config = RedisConfig::default();
+    let policy = ReconnectPolicy::default();
+    let redis_client = RedisClient::new(config);
+    // connect to the server, returning a handle to the task that drives the connection
+    let _ = redis_client.connect(Some(policy));
+    let _ = redis_client.wait_for_connect().await.unwrap();
+
+    // 웹 서버 핸들러간 공유
+    let app_state = Arc::new(AppState {
+        user_set,
+        tx,
+        redis: redis_client.clone(),
+    });
 
     let app = Router::new()
         .route("/", get(index))
@@ -67,6 +88,16 @@ async fn websocket_handler(
 async fn websocket(stream: WebSocket, state: Arc<AppState>) {
     // By splitting we can send and receive at the same time.
     let (mut sender, mut receiver) = stream.split();
+
+    // 테스트용 ws handler가 Result 반환을 못해서 match로 항상 결과를 unwrap 해야함
+    let foo: Option<String> = match state.redis.get("foo").await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("레디스 에러: {}", e);
+            return;
+        }
+    };
+    tracing::debug!("redis foo: {:?}", foo);
 
     // Username gets set in the receive loop, if it's valid.
     let mut username = String::new();

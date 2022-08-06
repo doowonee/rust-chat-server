@@ -25,7 +25,9 @@
             this.disabled = true;
 
             const websocket = new WebSocket("ws://localhost:3000/websocket");
-
+            websocket.onerror = function (e) {
+                console.log("connection error: " + e);
+            }
             websocket.onopen = function () {
                 console.log("connection opened");
                 websocket.send(username.value);
