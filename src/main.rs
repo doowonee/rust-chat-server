@@ -6,8 +6,6 @@
 //! cd examples && cargo run -p example-chat
 //! ```
 
-mod error;
-
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -18,6 +16,7 @@ use axum::{
     Router,
 };
 use fred::{
+    clients::SubscriberClient,
     prelude::*,
     types::{ReconnectPolicy, RedisConfig},
 };
@@ -34,14 +33,18 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 struct AppState {
     user_set: Mutex<HashSet<String>>,
     tx: broadcast::Sender<String>,
-    redis: RedisClient,
+    redis_client: RedisClient,
+    redis_subscriber: SubscriberClient,
 }
+
+/// pub sub 대상 채널 이름
+const REDIS_CHANNEL_NAME: &str = "zxc";
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "example_chat=trace".into()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "debug".into()),
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -53,16 +56,28 @@ async fn main() {
     // Redis 클라이언트 준비
     let config = RedisConfig::default();
     let policy = ReconnectPolicy::default();
-    let redis_client = RedisClient::new(config);
+    let redis_client = RedisClient::new(config.clone());
     // connect to the server, returning a handle to the task that drives the connection
-    let _ = redis_client.connect(Some(policy));
+    let _ = redis_client.connect(Some(policy.clone()));
     let _ = redis_client.wait_for_connect().await.unwrap();
+
+    // fred SubscriberClient 사용해서 redis subscribe 자동 재연결 처리
+    let redis_subscriber = SubscriberClient::new(config);
+    let _ = redis_subscriber.connect(Some(policy));
+    let _ = redis_subscriber.wait_for_connect().await.unwrap();
+    let _ = redis_subscriber.manage_subscriptions();
+    let _ = redis_subscriber
+        .subscribe(REDIS_CHANNEL_NAME)
+        .await
+        .unwrap();
+    tracing::info!("redis subscribe 완료");
 
     // 웹 서버 핸들러간 공유
     let app_state = Arc::new(AppState {
         user_set,
         tx,
-        redis: redis_client.clone(),
+        redis_client,
+        redis_subscriber,
     });
 
     let app = Router::new()
@@ -88,16 +103,6 @@ async fn websocket_handler(
 async fn websocket(stream: WebSocket, state: Arc<AppState>) {
     // By splitting we can send and receive at the same time.
     let (mut sender, mut receiver) = stream.split();
-
-    // 테스트용 ws handler가 Result 반환을 못해서 match로 항상 결과를 unwrap 해야함
-    let foo: Option<String> = match state.redis.get("foo").await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("레디스 에러: {}", e);
-            return;
-        }
-    };
-    tracing::debug!("redis foo: {:?}", foo);
 
     // Username gets set in the receive loop, if it's valid.
     let mut username = String::new();
@@ -127,29 +132,70 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
     // Send joined message to all subscribers.
     let msg = format!("{} joined.", username);
     tracing::debug!("{}", msg);
-    let _ = state.tx.send(msg);
+    let redis_client = state.redis_client.clone();
+    // @TODO unwrap 에러시 몇번 재시도 하고 에러로 취급
+    let received_clients: i64 = redis_client
+        .publish(REDIS_CHANNEL_NAME, &msg)
+        .await
+        .unwrap();
+    tracing::debug!("redis publish: {}", received_clients);
+    // let _ = state.tx.send(msg);
 
     // This task will receive broadcast messages and send text message to our client.
+    // let mut send_task = tokio::spawn(async move {
+    //     while let Ok(msg) = rx.recv().await {
+    //         // In any websocket error, break loop.
+    //         if sender.send(Message::Text(msg)).await.is_err() {
+    //             break;
+    //         }
+    //     }
+    // });
+
+    let redis_subscriber = state.redis_subscriber.clone();
+    // redis subscribe 한 데이터를 웹소켓으로 전송
     let mut send_task = tokio::spawn(async move {
-        while let Ok(msg) = rx.recv().await {
-            // In any websocket error, break loop.
-            if sender.send(Message::Text(msg)).await.is_err() {
+        let mut message_stream = redis_subscriber.on_message();
+        while let Some((channel, message)) = message_stream.next().await {
+            tracing::debug!("Recv {:?} on channel {}", message, channel);
+            if sender
+                .send(Message::Text(message.as_string().unwrap_or_default()))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
+        Ok::<_, RedisError>(())
     });
 
+    // let mut send_task = tokio::spawn(redis_subscriber.on_message().for_each(
+    //     |(channel, message)| {
+    //         println!("Recv {:?} on channel {}", message, channel);
+    //         Ok(())
+    //     },
+    // ));
+
+    // tracing::debug!("Recv {:?} on channel {}", message, channel);
     // Clone things we want to pass to the receiving task.
     let tx = state.tx.clone();
+    let redis_client = state.redis_client.clone();
     let name = username.clone();
 
     // This task will receive messages from client and send them to broadcast subscribers.
+    // 웹소켓으로 부터 데이터를 수신하면 redis로 publish
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(Message::Text(text))) = receiver.next().await {
-            let msg = format!("{}: {}", name, text);
-            tracing::debug!("채팅방에 전달 할거 {}", msg);
             // Add username before message.
-            let _ = tx.send(msg);
+            let msg = format!("{}: {}", name, text);
+            tracing::debug!("redis에 전달 할거 {}", msg);
+            // @TODO unwrap 에러시 몇번 재시도 하고 에러로 취급
+            let received_clients: i64 = redis_client
+                .publish(REDIS_CHANNEL_NAME, &msg)
+                .await
+                .unwrap();
+            tracing::debug!("redis publish: {}", received_clients);
+            // 서버 내에서 송신 채널에는 데이터 전송 안함
+            // let _ = tx.send(msg);
         }
     });
 
@@ -162,7 +208,15 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
     // Send user left message.
     let msg = format!("{} left.", username);
     tracing::debug!("{}", msg);
-    let _ = state.tx.send(msg);
+    let redis_client = state.redis_client.clone();
+    // @TODO unwrap 에러시 몇번 재시도 하고 에러로 취급
+    let received_clients: i64 = redis_client
+        .publish(REDIS_CHANNEL_NAME, &msg)
+        .await
+        .unwrap();
+    tracing::debug!("redis publish: {}", received_clients);
+    // let _ = state.tx.send(msg);
+
     // Remove username from map so new clients can take it.
     state.user_set.lock().unwrap().remove(&username);
 }
