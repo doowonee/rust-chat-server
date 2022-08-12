@@ -20,6 +20,7 @@ use axum::{
     Router,
 };
 use chrono::prelude::*;
+use error::Error;
 use fred::{
     clients::SubscriberClient,
     prelude::*,
@@ -39,7 +40,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::protocol::{PacketKind, Pong};
+use crate::protocol::{AuthFail, AuthRequest, AuthSuccess, Packet, PacketKind, Ping, Pong};
 
 // Our shared state
 struct AppState {
@@ -142,36 +143,76 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
     // Loop until a text message is found.
     while let Some(Ok(message)) = receiver.next().await {
         if let Message::Text(payload) = message {
-            let a = match PacketKind::try_from(payload.as_str()) {
-                Ok(v) => {
-                    tracing::info!("수신 패킷 {:?}", v);
-                    let res = PacketKind::Pong(Pong {
-                        op_code: 2,
-                        server_epoch: Utc::now().timestamp_millis(),
-                    });
-                    let _ = ub_tx.send(Ok(Message::Text(
-                        serde_json::to_string(&res).unwrap_or_default(),
-                    )));
-                    return;
-                }
+            tracing::debug!("수신 패킷 {}", payload);
+            let received_epoch = Utc::now().timestamp_millis();
+            // return statement means close the connection
+
+            // check packet format
+            let packet: Packet = match serde_json::from_str(&payload) {
+                Ok(v) => v,
                 Err(e) => {
-                    tracing::error!("{}", e);
-                    let _ = ub_tx.send(Ok(Message::Text(String::from("프로토콜 에러"))));
+                    tracing::error!("wrong json: {} payload: {}", e, payload);
                     return;
                 }
             };
 
-            // // If username that is sent by client is not taken, fill username string.
-            // check_username(&state, &mut username, &name);
+            // handel only request op code
+            match packet.op_code {
+                PacketKind::Ping => {
+                    let req: Ping = match serde_json::from_value(packet.payload) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::error!("wrong ping: {} payload: {}", e, payload);
+                            return;
+                        }
+                    };
 
-            // // If not empty we want to quit the loop else we want to quit function.
-            // if !username.is_empty() {
-            //     break;
-            // } else {
-            //     // Only send our client that username is taken.
-            //     let _ = ub_tx.send(Ok(Message::Text(String::from("Username already taken."))));
-            //     return;
-            // }
+                    // send pong to client
+                    let res = Pong {
+                        client_epoch: req.client_epoch,
+                        received_epoch,
+                        server_epoch: Utc::now().timestamp_millis(),
+                    };
+                    let _ = ub_tx.send(Ok(Message::Text(
+                        serde_json::to_string(&res).unwrap_or_default(),
+                    )));
+                }
+                PacketKind::AuthRequest => {
+                    let req: AuthRequest = match serde_json::from_value(packet.payload) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::error!("wrong AuthRequest: {} payload: {}", e, payload);
+                            return;
+                        }
+                    };
+
+                    match authenticate(&state, &sid, &req.user_id) {
+                        Ok(_) => {
+                            let res = AuthSuccess {
+                                user_name: req.user_name,
+                                user_id: req.user_id,
+                                session_id: sid.clone(),
+                            };
+                            let _ = ub_tx.send(Ok(Message::Text(
+                                serde_json::to_string(&res).unwrap_or_default(),
+                            )));
+                        }
+                        Err(e) => {
+                            tracing::error!("인증 실패: {}", e);
+                            let res = AuthFail {
+                                session_id: sid.clone(),
+                            };
+                            let _ = ub_tx.send(Ok(Message::Text(
+                                serde_json::to_string(&res).unwrap_or_default(),
+                            )));
+                        }
+                    };
+                }
+                _ => {
+                    tracing::error!("{:?} wrong request {}", packet.op_code, payload);
+                    return;
+                }
+            };
         }
     }
 
@@ -276,13 +317,17 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
     state.user_set.lock().unwrap().remove(&username);
 }
 
-fn check_username(state: &AppState, string: &mut String, name: &str) {
+fn authenticate(state: &AppState, sid: &str, user_id: &str) -> Result<(), Error> {
+    // 함수가 끝나면 자동 lock 해제
     let mut user_set = state.user_set.lock().unwrap();
 
-    if !user_set.contains(name) {
-        user_set.insert(name.to_owned());
-
-        string.push_str(name);
+    // 일단 중복 아이디일 경우 인증 실패 처리
+    if !user_set.contains(user_id) {
+        user_set.insert(user_id.to_owned());
+        Ok(())
+    } else {
+        let msg = format!("테스트용 인증 실패 {}", sid);
+        Err(Error::Unknown(msg))
     }
 }
 
