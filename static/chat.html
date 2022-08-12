@@ -1,57 +1,82 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html lang="ko">
 
 <head>
-    <meta charset="UTF-8">
-    <title>WebSocket Chat</title>
+    <meta charset="utf-8">
+    <title></title>
+    <meta name="description" content="">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#fafafa">
+    <style>
+        #chat {
+            height: 200px;
+            border: 1px black solid;
+            overflow-y: auto;
+            max-width: 600px;
+            padding: 8px;
+        }
+
+        #server {
+            width: 300px;
+        }
+
+        #text {
+            width: 600px;
+            height: 90px;
+        }
+    </style>
 </head>
 
 <body>
-    <h1>WebSocket Chat Example</h1>
+    <h1>Rust chat server</h1>
+    <div id="chat">
+        <p><em>Connecting...</em></p>
+    </div>
+    <p>
+        <input type="text" id="server" value="ws://localhost:3000/websocket" disabled>
+        <button type="button" id="server_btn">Connect</button>
+    </p>
+    <p>
+        <textarea type="text" id="text"></textarea>
+        <button type="button" id="send">Send</button>
+    </p>
+    <p>Ping</p>
+    <p>{"o":1,"t":1636363}</p>
+    <script type="text/javascript">
+        const server = document.getElementById('server');
+        const chat = document.getElementById('chat');
+        const text = document.getElementById('text');
+        // websocket object
+        var ws = {};
 
-    <input id="username" style="display:block; width:100px; box-sizing: border-box" type="text" placeholder="username">
-    <button id="join-chat" type="button">Join Chat</button>
-    <textarea id="chat" style="display:block; width:600px; height:400px; box-sizing: border-box" cols="30"
-        rows="10"></textarea>
-    <input id="input" style="display:block; width:600px; box-sizing: border-box" type="text" placeholder="chat">
+        function message(data) {
+            const line = document.createElement('p');
+            line.innerText = data;
+            chat.appendChild(line);
+        }
 
-    <script>
-        const username = document.querySelector("#username");
-        const join_btn = document.querySelector("#join-chat");
-        const textarea = document.querySelector("#chat");
-        const input = document.querySelector("#input");
+        send.onclick = function () {
+            const msg = text.value;
+            ws.send(msg);
+            text.value = '';
+            message('<tx>: ' + msg);
+        };
 
-        join_btn.addEventListener("click", function (e) {
-            this.disabled = true;
+        server_btn.onclick = function () {
+            ws = new WebSocket(server.value);
+            ws.onopen = function () {
+                chat.innerHTML = '<p><em>Connected!</em></p>';
+            };
 
-            const websocket = new WebSocket("ws://localhost:3000/websocket");
-            websocket.onerror = function (e) {
-                console.log("connection error: " + e);
-            }
-            websocket.onopen = function () {
-                console.log("connection opened");
-                websocket.send(username.value);
-            }
+            ws.onmessage = function (msg) {
+                const rev = "<rx>: " + msg.data;
+                message(rev);
+            };
 
-            const btn = this;
-
-            websocket.onclose = function () {
-                console.log("connection closed");
-                btn.disabled = false;
-            }
-
-            websocket.onmessage = function (e) {
-                console.log("received message: " + e.data);
-                textarea.value += e.data + "\r\n";
-            }
-
-            input.onkeydown = function (e) {
-                if (e.key == "Enter") {
-                    websocket.send(input.value);
-                    input.value = "";
-                }
-            }
-        });
+            ws.onclose = function () {
+                chat.getElementsByTagName('em')[0].innerText = 'Disconnected!';
+            };
+        };
     </script>
 </body>
 
