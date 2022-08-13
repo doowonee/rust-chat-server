@@ -20,19 +20,15 @@ use axum::{
     Router,
 };
 use chrono::prelude::*;
-use error::Error;
 use fred::{
     clients::SubscriberClient,
     prelude::*,
     types::{ReconnectPolicy, RedisConfig},
 };
-use futures::{
-    sink::SinkExt,
-    stream::{SplitSink, StreamExt},
-    FutureExt,
-};
+use futures::{stream::StreamExt, FutureExt};
+use session::Session;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
@@ -40,22 +36,21 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::protocol::{AuthRequest, Packet, PacketKind, Ping};
+use crate::protocol::{AuthRequest, PacketKind, Ping, Request, SendTextRequest};
 
 // Our shared state
 pub struct AppState {
-    user_set: Mutex<HashSet<String>>,
-    /// 세션 아이디를 키로 하고 웹소켓 송신 스트림을 값으로 하는 트리맵
-    websocket_sessions: Mutex<BTreeMap<String, SplitSink<WebSocket, Message>>>,
-    // /// 세션 아이디를 키 유저 아디 정보를 담은 트리맵
-    // websocket_sessions: Mutex<BTreeMap<String, String>>,
+    /// 세션 아이디를 키로 하고 세션 구조체를 값으로 하는 맵
+    sessions: Mutex<BTreeMap<String, Session>>,
+    /// 유저 아이디를 키로하고 세션 아이디를 값으로 하는 트리맵
+    users: Mutex<BTreeMap<String, String>>,
     tx: broadcast::Sender<String>,
     redis_client: RedisClient,
     redis_subscriber: SubscriberClient,
 }
 
 /// pub sub 대상 채널 이름
-const REDIS_CHANNEL_NAME: &str = "zxc";
+pub const REDIS_CHANNEL_NAME: &str = "zxc";
 
 #[tokio::main]
 async fn main() {
@@ -67,7 +62,6 @@ async fn main() {
         .init();
 
     // 서버 내부 메모리 에서 유저풀 관리
-    let user_set = Mutex::new(HashSet::new());
     let (tx, _rx) = broadcast::channel(100);
 
     // Redis 클라이언트 준비
@@ -89,11 +83,12 @@ async fn main() {
         .unwrap();
     tracing::info!("redis subscribe 완료");
 
-    let websocket_sessions = Mutex::new(BTreeMap::new());
+    let sessions = Mutex::new(BTreeMap::new());
+    let users = Mutex::new(BTreeMap::new());
     // 웹 서버 핸들러간 공유
     let app_state = Arc::new(AppState {
-        user_set,
-        websocket_sessions,
+        sessions,
+        users,
         tx,
         redis_client,
         redis_subscriber,
@@ -138,6 +133,12 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
         }
     }));
 
+    // 세션 정보에 웹소켓 송신 스트림 정보를 넣는다
+    let mut sessions = state.sessions.lock().unwrap();
+    sessions.insert(sid.clone(), Session::new(&sid, ub_tx.clone()));
+    // 함수가 끝나야 drop 되므로 명시적으로 락 해제 한다
+    drop(sessions);
+
     // Username gets set in the receive loop, if it's valid.
     let mut username = String::new();
     // Loop until a text message is found.
@@ -148,7 +149,7 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
             // return statement means close the connection
 
             // check packet format
-            let packet: Packet = match serde_json::from_str(&payload) {
+            let packet: Request = match serde_json::from_str(&payload) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::error!("Wrong JSON: {} payload: {}", e, payload);
@@ -181,6 +182,17 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
 
                     let res = req.handle(&sid, &state).await;
                     let _ = ub_tx.send(Ok(Message::Text(res)));
+                }
+                PacketKind::SendTextRequest => {
+                    let req: SendTextRequest = match serde_json::from_value(packet.payload) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::error!("Wrong SendTextRequest: {} payload: {}", e, payload);
+                            return;
+                        }
+                    };
+
+                    req.handle(&sid, ub_tx.clone(), &state).await;
                 }
                 _ => {
                     tracing::error!("{:?} Wrong Request {}", packet.op_code, payload);
@@ -276,7 +288,21 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
     };
 
     // Send user left message.
-    tracing::debug!("{} 연결 종료", sid);
+    tracing::debug!("{} 연결 종료 감지", sid);
+    // 인증된 세션이면 유저 정보 삭제 그리고 세션 정보 삭제
+    let mut sessions = state.sessions.lock().unwrap();
+    match sessions.get(&sid) {
+        Some(v) => {
+            let mut users = state.users.lock().unwrap();
+            users.remove(&v.user().map(|v| v.id.clone()).unwrap_or_default());
+            sessions.remove(&sid);
+            tracing::debug!("{} 세션 제거 완료", sid);
+        }
+        None => {
+            tracing::debug!("{} 인증 안한 세션이라 그냥 종료", sid);
+        }
+    };
+
     // let msg = format!("{} left.", username);
     // tracing::debug!("{}", msg);
     // let redis_client = state.redis_client.clone();

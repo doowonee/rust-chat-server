@@ -1,11 +1,42 @@
 //! websocket session
 
+use axum::{extract::ws::Message, Error};
 use bson::oid::ObjectId;
+use tokio::sync::mpsc::UnboundedSender;
 
 pub fn generate_id() -> String {
     format!("ws{}", ObjectId::new())
 }
 
-// 유저아디랑 세션이랑 구분
-// 세션별로 채팅룸별로 전달 해야되나 안되나 구분
-// 송 수신 채널 분리
+/// 세션 정보로 인증된 유저면 유저 정보가 존재
+pub struct Session {
+    id: String,
+    tx: UnboundedSender<Result<Message, Error>>,
+    user_info: Option<User>,
+}
+
+impl Session {
+    pub fn new(sid: &str, tx: UnboundedSender<Result<Message, Error>>) -> Session {
+        Session {
+            id: sid.into(),
+            tx,
+            user_info: None,
+        }
+    }
+
+    /// 인증 정보를 저장 한다
+    pub fn auth(&mut self, user_info: User) {
+        self.user_info = Some(user_info);
+    }
+
+    /// 유저정보 조회
+    pub fn user(&self) -> Option<&User> {
+        self.user_info.as_ref()
+    }
+}
+
+/// 인증시 생성되는 유저 정보
+pub struct User {
+    pub id: String,
+    pub name: String,
+}
