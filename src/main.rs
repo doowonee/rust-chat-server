@@ -17,45 +17,42 @@ use axum::{
     },
     response::{Html, IntoResponse},
     routing::get,
-    Router,
+    Error, Router,
 };
 use chrono::prelude::*;
-use error::Error;
 use fred::{
     clients::SubscriberClient,
     prelude::*,
     types::{ReconnectPolicy, RedisConfig},
 };
-use futures::{
-    sink::SinkExt,
-    stream::{SplitSink, StreamExt},
-    FutureExt,
-};
+use futures::{stream::StreamExt, FutureExt};
+use session::Session;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::protocol::{AuthRequest, Packet, PacketKind, Ping};
+use crate::protocol::{AuthRequest, PacketKind, Ping, Request, SendTextRequest};
 
 // Our shared state
 pub struct AppState {
-    user_set: Mutex<HashSet<String>>,
-    /// 세션 아이디를 키로 하고 웹소켓 송신 스트림을 값으로 하는 트리맵
-    websocket_sessions: Mutex<BTreeMap<String, SplitSink<WebSocket, Message>>>,
-    // /// 세션 아이디를 키 유저 아디 정보를 담은 트리맵
-    // websocket_sessions: Mutex<BTreeMap<String, String>>,
-    tx: broadcast::Sender<String>,
+    /// 세션 아이디를 키로 하고 세션 구조체를 값으로 하는 맵
+    sessions: Mutex<BTreeMap<String, Session>>,
+    /// 유저 아이디를 키로하고 세션 아이디를 값으로 하는 트리맵
+    users: Mutex<BTreeMap<String, String>>,
     redis_client: RedisClient,
     redis_subscriber: SubscriberClient,
 }
 
 /// pub sub 대상 채널 이름
-const REDIS_CHANNEL_NAME: &str = "zxc";
+pub const REDIS_CHANNEL_NAME: &str = "zxc";
+
+/// ubounded channel 로 웹소켓 송신 채널로 포워딩 된다
+pub type WebsocketTx = UnboundedSender<Result<Message, Error>>;
 
 #[tokio::main]
 async fn main() {
@@ -65,10 +62,6 @@ async fn main() {
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
-
-    // 서버 내부 메모리 에서 유저풀 관리
-    let user_set = Mutex::new(HashSet::new());
-    let (tx, _rx) = broadcast::channel(100);
 
     // Redis 클라이언트 준비
     let config = RedisConfig::default();
@@ -89,12 +82,12 @@ async fn main() {
         .unwrap();
     tracing::info!("redis subscribe 완료");
 
-    let websocket_sessions = Mutex::new(BTreeMap::new());
+    let sessions = Mutex::new(BTreeMap::new());
+    let users = Mutex::new(BTreeMap::new());
     // 웹 서버 핸들러간 공유
     let app_state = Arc::new(AppState {
-        user_set,
-        websocket_sessions,
-        tx,
+        sessions,
+        users,
         redis_client,
         redis_subscriber,
     });
@@ -122,7 +115,7 @@ async fn websocket_handler(
 async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
     tracing::debug!("{} 연결 수립", sid);
     // By splitting we can send and receive at the same time.
-    let (mut sender, mut receiver) = stream.split();
+    let (sender, mut receiver) = stream.split();
 
     // Use an unbounded channel to handle buffering and flushing of messages
     // to the websocket...K
@@ -138,134 +131,100 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
         }
     }));
 
-    // Username gets set in the receive loop, if it's valid.
-    let mut username = String::new();
-    // Loop until a text message is found.
-    while let Some(Ok(message)) = receiver.next().await {
-        if let Message::Text(payload) = message {
-            let now = Utc::now().naive_utc();
-            tracing::debug!("수신 패킷 {}", payload);
-            // return statement means close the connection
+    // 세션 정보에 웹소켓 송신 스트림 정보를 넣는다
+    session::add_session(&state, &sid, ub_tx.clone());
 
-            // check packet format
-            let packet: Packet = match serde_json::from_str(&payload) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!("Wrong JSON: {} payload: {}", e, payload);
-                    return;
-                }
-            };
-
-            // handel only request op code
-            match packet.op_code {
-                PacketKind::Ping => {
-                    let req: Ping = match serde_json::from_value(packet.payload) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::error!("Wrong Ping: {} payload: {}", e, payload);
-                            return;
-                        }
-                    };
-
-                    let res = req.handle(now).await;
-                    let _ = ub_tx.send(Ok(Message::Text(res)));
-                }
-                PacketKind::AuthRequest => {
-                    let req: AuthRequest = match serde_json::from_value(packet.payload) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::error!("Wrong AuthRequest: {} payload: {}", e, payload);
-                            return;
-                        }
-                    };
-
-                    let res = req.handle(&sid, &state).await;
-                    let _ = ub_tx.send(Ok(Message::Text(res)));
-                }
-                _ => {
-                    tracing::error!("{:?} Wrong Request {}", packet.op_code, payload);
-                    return;
-                }
-            };
-        }
-    }
-
-    // Subscribe before sending joined message.
-    let mut rx = state.tx.subscribe();
-
-    // // Send joined message to all subscribers.
-    // let msg = format!("{} joined.", username);
-    // tracing::debug!("{}", msg);
-    // let redis_client = state.redis_client.clone();
-    // // @TODO unwrap 에러시 몇번 재시도 하고 에러로 취급
-    // let received_clients: i64 = redis_client
-    //     .publish(REDIS_CHANNEL_NAME, &msg)
-    //     .await
-    //     .unwrap();
-    // tracing::debug!("redis publish: {}", received_clients);
-    // let _ = state.tx.send(msg);
-
-    // This task will receive broadcast messages and send text message to our client.
-    // let mut send_task = tokio::spawn(async move {
-    //     while let Ok(msg) = rx.recv().await {
-    //         // In any websocket error, break loop.
-    //         if sender.send(Message::Text(msg)).await.is_err() {
-    //             break;
-    //         }
-    //     }
-    // });
-
+    tracing::debug!("redis subscribe 준비");
     let redis_subscriber = state.redis_subscriber.clone();
+    let cloned_tx = ub_tx.clone();
+    let cloned_sid = sid.clone();
     // redis subscribe 한 데이터를 웹소켓으로 전송
     let mut send_task = tokio::spawn(async move {
         let mut message_stream = redis_subscriber.on_message();
         while let Some((channel, message)) = message_stream.next().await {
-            tracing::debug!("Recv {:?} on channel {}", message, channel);
-            if ub_tx
+            tracing::debug!(
+                "세션 {} 수신 {:?} on channel {}",
+                cloned_sid,
+                message,
+                channel
+            );
+            // @TODO 레디스로 받은 메시지는 전체 전파 용이므로 일단 전체 전파 나중에 채팅방 개념 생기면 그때 필터링
+            if cloned_tx
                 .send(Ok(Message::Text(message.as_string().unwrap_or_default())))
                 .is_err()
             {
                 break;
             }
-            // if sender
-            //     .send(Message::Text(message.as_string().unwrap_or_default()))
-            //     .await
-            //     .is_err()
-            // {
-            //     break;
-            // }
         }
         Ok::<_, RedisError>(())
     });
-
-    // let mut send_task = tokio::spawn(redis_subscriber.on_message().for_each(
-    //     |(channel, message)| {
-    //         println!("Recv {:?} on channel {}", message, channel);
-    //         Ok(())
-    //     },
-    // ));
-
-    // tracing::debug!("Recv {:?} on channel {}", message, channel);
-    // Clone things we want to pass to the receiving task.
-    let tx = state.tx.clone();
-    let redis_client = state.redis_client.clone();
-    let name = username.clone();
+    tracing::debug!("redis subscribe 블록 벗어남");
 
     // This task will receive messages from client and send them to broadcast subscribers.
     // 웹소켓으로 부터 데이터를 수신하면 redis로 publish
+    let cloned_sid = sid.clone();
+    let cloned_state = state.clone();
     let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(Message::Text(text))) = receiver.next().await {
-            // Add username before message.
-            let msg = format!("{}: {}", name, text);
-            tracing::debug!("redis에 전달 할거 {}", msg);
-            // @TODO unwrap 에러시 몇번 재시도 하고 에러로 취급
-            let received_clients: i64 = redis_client
-                .publish(REDIS_CHANNEL_NAME, &msg)
-                .await
-                .unwrap();
-            tracing::debug!("redis publish: {}", received_clients);
-            // 서버 내에서 송신 채널에는 데이터 전송 안함
-            // let _ = tx.send(msg);
+        while let Some(Ok(message)) = receiver.next().await {
+            if let Message::Text(payload) = message {
+                let now = Utc::now().naive_utc();
+                tracing::debug!("수신 패킷 {}", payload);
+                // return statement means close the connection
+
+                // check packet format
+                let packet: Request = match serde_json::from_str(&payload) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!("Wrong JSON: {} payload: {}", e, payload);
+                        return;
+                    }
+                };
+
+                // handel only request op code
+                match packet.op_code {
+                    PacketKind::Ping => {
+                        let req: Ping = match serde_json::from_value(packet.payload) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::error!("Wrong Ping: {} payload: {}", e, payload);
+                                return;
+                            }
+                        };
+
+                        req.handle(sid.clone(), ub_tx.clone(), now).await;
+                    }
+                    PacketKind::AuthRequest => {
+                        let req: AuthRequest = match serde_json::from_value(packet.payload) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::error!("Wrong AuthRequest: {} payload: {}", e, payload);
+                                return;
+                            }
+                        };
+
+                        req.handle(sid.clone(), ub_tx.clone(), state.clone()).await;
+                    }
+                    PacketKind::SendTextRequest => {
+                        let req: SendTextRequest = match serde_json::from_value(packet.payload) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::error!(
+                                    "Wrong SendTextRequest: {} payload: {}",
+                                    e,
+                                    payload
+                                );
+                                return;
+                            }
+                        };
+
+                        req.handle(sid.clone(), ub_tx.clone(), state.clone()).await;
+                    }
+                    _ => {
+                        tracing::error!("{:?} Wrong Request {}", packet.op_code, payload);
+                        return;
+                    }
+                };
+            }
         }
     });
 
@@ -276,7 +235,21 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
     };
 
     // Send user left message.
-    tracing::debug!("{} 연결 종료", sid);
+    tracing::debug!("{} 연결 종료 감지", cloned_sid);
+    // 인증된 세션이면 유저 정보 삭제 그리고 세션 정보 삭제
+    let mut sessions = cloned_state.sessions.lock().unwrap();
+    match sessions.get(&cloned_sid) {
+        Some(v) => {
+            let mut users = cloned_state.users.lock().unwrap();
+            users.remove(&v.user().map(|v| v.id.clone()).unwrap_or_default());
+            sessions.remove(&cloned_sid);
+            tracing::debug!("{} 세션 제거 완료", cloned_sid);
+        }
+        None => {
+            tracing::debug!("{} 인증 안한 세션이라 그냥 종료", cloned_sid);
+        }
+    };
+
     // let msg = format!("{} left.", username);
     // tracing::debug!("{}", msg);
     // let redis_client = state.redis_client.clone();
