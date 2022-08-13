@@ -4,82 +4,119 @@
 //! op_code를 enum 화 하여 optional 한 필드로 단일 struct
 //! 가 아니라 enum 즉 프로토콜 타입별로 struct를 사용
 
-use num_enum::TryFromPrimitive;
 use serde::{Deserialize, Serialize};
-use serde_repr::{Deserialize_repr, Serialize_repr};
+
+use crate::error::{self, Error};
 
 /// 프로토콜
-#[derive(Debug, TryFromPrimitive, Serialize_repr, Deserialize_repr)]
-#[repr(i16)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum PacketKind {
-    Ping = 1,
-    Pong = 2,
-    AuthRequest = 10,
-    AuthSuccess = 11,
-    AuthFail = 12,
+    Ping(Ping),
+    Pong(Pong),
 }
 
-// @TODO 응답에 op_code 추가
-// pub fn make_response<T: Serialize>(packet_kind: PacketKind, T) -> String {
-//     serde_json::to_string(&T).unwrap_or_default(),
-// }
+impl PacketKind {
+    /// 프로토콜에 따른 숫자 코드 값을 반환 한다.
+    pub fn as_code(&self) -> i16 {
+        match self {
+            PacketKind::Ping(_) => 1,
+            PacketKind::Pong(_) => 2,
+        }
+    }
+    /// 요청 프로토콜 여부
+    pub fn is_request(&self) -> bool {
+        match self {
+            PacketKind::Ping(_) => true,
+            PacketKind::Pong(_) => false,
+        }
+    }
+}
 
-/// 통신 패킷 체크 응답
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Packet {
-    /// op code
-    #[serde(rename = "o")]
-    pub op_code: PacketKind,
-    /// 페이로드
-    #[serde(flatten)]
-    pub payload: serde_json::Value,
+impl TryFrom<&str> for PacketKind {
+    type Error = error::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        // JSON format check
+        let json_value: serde_json::Value = match serde_json::from_str(value) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(Error::ProtocolInvalid(format!(
+                    "json parsing failed: {}",
+                    e
+                )));
+            }
+        };
+
+        // op code field name type check
+        let op_code = match json_value["o"].as_i64() {
+            Some(v) => match i16::try_from(v) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(Error::ProtocolInvalid(format!("op_code wrong: {}", e)));
+                }
+            },
+            None => {
+                return Err(Error::ProtocolInvalid(format!(
+                    "op_code wrong: {}",
+                    json_value
+                )));
+            }
+        };
+
+        let paylaod = match op_code {
+            1 => {
+                let payload: Ping = match serde_json::from_value(json_value) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err(Error::ProtocolInvalid(format!(
+                            "op_code and payload not matched: {}",
+                            e
+                        )));
+                    }
+                };
+                PacketKind::Ping(payload)
+            }
+            2 => {
+                let payload: Pong = match serde_json::from_value(json_value) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err(Error::ProtocolInvalid(format!(
+                            "op_code and payload not matched: {}",
+                            e
+                        )));
+                    }
+                };
+                PacketKind::Pong(payload)
+            }
+            _ => {
+                return Err(Error::ProtocolInvalid(format!(
+                    "op_code wrong: {}",
+                    json_value
+                )));
+            }
+        };
+        Ok(paylaod)
+    }
 }
 
 /// 통신 상태 체크 요청
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Ping {
-    /// epoch from client
+    /// op code
+    #[serde(rename = "o")]
+    op_code: i16,
+    /// 클라의 현재 시간 epoch
     #[serde(rename = "t")]
-    pub client_epoch: i64,
+    client_epoch: i64,
 }
 
 /// 통신 상태 체크 응답
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Pong {
-    /// epoch from client
-    #[serde(rename = "t1")]
-    pub client_epoch: i64,
-    /// epoch when received from client
-    #[serde(rename = "t2")]
-    pub received_epoch: i64,
-    /// epoch when send from server
-    #[serde(rename = "t3")]
+    /// op code
+    #[serde(rename = "o")]
+    pub op_code: i16,
+    /// 서버의 현재 시간 epoch
+    #[serde(rename = "t")]
     pub server_epoch: i64,
-}
-
-/// 인증 요청
-#[derive(Serialize, Deserialize, Debug)]
-pub struct AuthRequest {
-    #[serde(rename = "n")]
-    pub user_name: String,
-    #[serde(rename = "i")]
-    pub user_id: String,
-}
-
-/// 인증 성공
-#[derive(Serialize, Deserialize, Debug)]
-pub struct AuthSuccess {
-    #[serde(rename = "n")]
-    pub user_name: String,
-    #[serde(rename = "i")]
-    pub user_id: String,
-    #[serde(rename = "s")]
-    pub session_id: String,
-}
-
-/// 인증 실패
-#[derive(Serialize, Deserialize, Debug)]
-pub struct AuthFail {
-    #[serde(rename = "s")]
-    pub session_id: String,
 }
