@@ -139,14 +139,14 @@ impl SendTextRequest {
     /// 요청 패킷 처리
     pub async fn handle(
         &self,
-        sid: &str,
+        sid: String,
         tx: UnboundedSender<Result<Message, Error>>,
         state: &Arc<AppState>,
     ) {
         // 함수가 끝나면 자동 lock 해제
         let sessions = state.sessions.lock().unwrap();
 
-        match sessions.get(sid) {
+        match sessions.get(&sid) {
             Some(v) => {
                 match v.user() {
                     Some(u) => {
@@ -160,14 +160,24 @@ impl SendTextRequest {
                         let msg = format!("{}", json);
 
                         // redis publish로 브로드 캐스팅
-                        tracing::debug!("SendTextRequest 성공 {} {}", sid, msg);
                         let redis_client = state.redis_client.clone();
-                        let received_clients: i64 =
-                            redis_client.publish(REDIS_CHANNEL_NAME, msg).await.unwrap();
+                        // await를 할수 없어서 task 만들어서 비동기로 레디스에 publish
+                        tokio::spawn(async move {
+                            let received_clients: i64 = redis_client
+                                .publish(REDIS_CHANNEL_NAME, &msg)
+                                .await
+                                .unwrap();
+                            tracing::debug!(
+                                "SendTextRequest 성공 {} {} {}",
+                                received_clients,
+                                sid,
+                                msg
+                            );
+                        });
                     }
                     None => {
                         // 인증 안되서 전파 실패 처리
-                        tracing::error!("인증 안된 세션이래 채팅 전파 실패 {}", sid);
+                        tracing::error!("인증 안된 세션이라 채팅 전파 실패 {}", sid);
                         let json = serde_json::json!({
                             "o": PacketKind::SendTextFail,
                             "s": sid,

@@ -195,7 +195,7 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
                         }
                     };
 
-                    req.handle(&sid, ub_tx.clone(), &state).await;
+                    req.handle(sid.clone(), ub_tx.clone(), &state).await;
                 }
                 _ => {
                     tracing::error!("{:?} Wrong Request {}", packet.op_code, payload);
