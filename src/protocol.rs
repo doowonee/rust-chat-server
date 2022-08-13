@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{session::User, AppState, REDIS_CHANNEL_NAME};
+use crate::{session::User, AppState, WebsocketTx, REDIS_CHANNEL_NAME};
 
 /// 프로토콜
 #[derive(Debug, TryFromPrimitive, Serialize_repr, Deserialize_repr)]
@@ -65,14 +65,16 @@ pub struct Ping {
 
 impl Ping {
     /// 요청 패킷 처리
-    pub async fn handle(&self, now: NaiveDateTime) -> String {
+    pub async fn handle(&self, sid: String, tx: WebsocketTx, now: NaiveDateTime) {
         let json = serde_json::json!({
             "o": PacketKind::Pong,
             "t1": &self.client_epoch,
             "t2": now.timestamp_millis(),
             "t3": Utc::now().timestamp_millis(),
         });
-        format!("{}", json)
+        let msg = format!("{}", json);
+        // 송신자에게만 전파
+        let _ = tx.send(Ok(Message::Text(msg)));
     }
 }
 
@@ -86,46 +88,54 @@ pub struct AuthRequest {
 
 impl AuthRequest {
     /// 요청 패킷 처리
-    pub async fn handle(&self, sid: &str, state: &Arc<AppState>) -> String {
+    pub async fn handle(&self, sid: String, tx: WebsocketTx, state: Arc<AppState>) {
         // 함수가 끝나면 자동 lock 해제
         let mut users = state.users.lock().unwrap();
         let mut sessions = state.sessions.lock().unwrap();
 
         // 일단 중복 아이디일 경우 인증 실패 처리
-        let json = if !users.contains_key(&self.user_id) {
-            if let Some(session) = sessions.get_mut(sid) {
+        if !users.contains_key(&self.user_id) {
+            if let Some(session) = sessions.get_mut(&sid) {
                 // 유저 아이이디에 해당 세션 아이디를 넣고 유저정보에도 인증 정보를 담는다
-                users.insert(self.user_id.clone(), sid.into());
+                users.insert(self.user_id.clone(), sid.clone());
                 let user_info = User {
                     id: self.user_id.clone(),
                     name: self.user_name.clone(),
                 };
                 session.auth(user_info);
-                serde_json::json!({
+                let json = serde_json::json!({
                     "o": PacketKind::AuthSuccess,
                     "n": self.user_name,
                     "i": self.user_id,
                     "s": sid,
-                })
+                });
+                let msg = format!("{}", json);
+                // 송신자에게만 전파
+                let _ = tx.send(Ok(Message::Text(msg)));
             } else {
                 tracing::error!("테스트용 인증 실패: 세션 정보에 해당 세션이 없음 {}", sid);
-                serde_json::json!({
+                let json = serde_json::json!({
                     "o": PacketKind::AuthFail,
                     "n": self.user_name,
                     "i": self.user_id,
                     "s": sid,
-                })
+                });
+                let msg = format!("{}", json);
+                // 송신자에게만 전파
+                let _ = tx.send(Ok(Message::Text(msg)));
             }
         } else {
             tracing::error!("테스트용 인증 실패: 이미 인증된 세션임 {}", sid);
-            serde_json::json!({
+            let json = serde_json::json!({
                 "o": PacketKind::AuthFail,
                 "n": self.user_name,
                 "i": self.user_id,
                 "s": sid,
-            })
-        };
-        format!("{}", json)
+            });
+            let msg = format!("{}", json);
+            // 송신자에게만 전파
+            let _ = tx.send(Ok(Message::Text(msg)));
+        }
     }
 }
 
@@ -137,12 +147,7 @@ pub struct SendTextRequest {
 
 impl SendTextRequest {
     /// 요청 패킷 처리
-    pub async fn handle(
-        &self,
-        sid: String,
-        tx: UnboundedSender<Result<Message, Error>>,
-        state: &Arc<AppState>,
-    ) {
+    pub async fn handle(&self, sid: String, tx: WebsocketTx, state: Arc<AppState>) {
         // 함수가 끝나면 자동 lock 해제
         let sessions = state.sessions.lock().unwrap();
 
