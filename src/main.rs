@@ -6,8 +6,6 @@
 //! cd examples && cargo run -p example-chat
 //! ```
 
-mod error;
-mod protocol;
 mod session;
 
 use axum::{
@@ -19,7 +17,6 @@ use axum::{
     routing::get,
     Router,
 };
-use chrono::prelude::*;
 use fred::{
     clients::SubscriberClient,
     prelude::*,
@@ -38,8 +35,6 @@ use std::{
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-use crate::protocol::{PacketKind, Pong};
 
 // Our shared state
 struct AppState {
@@ -141,37 +136,18 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
     let mut username = String::new();
     // Loop until a text message is found.
     while let Some(Ok(message)) = receiver.next().await {
-        if let Message::Text(payload) = message {
-            let a = match PacketKind::try_from(payload.as_str()) {
-                Ok(v) => {
-                    tracing::info!("수신 패킷 {:?}", v);
-                    let res = PacketKind::Pong(Pong {
-                        op_code: 2,
-                        server_epoch: Utc::now().timestamp_millis(),
-                    });
-                    let _ = ub_tx.send(Ok(Message::Text(
-                        serde_json::to_string(&res).unwrap_or_default(),
-                    )));
-                    return;
-                }
-                Err(e) => {
-                    tracing::error!("{}", e);
-                    let _ = ub_tx.send(Ok(Message::Text(String::from("프로토콜 에러"))));
-                    return;
-                }
-            };
+        if let Message::Text(name) = message {
+            // If username that is sent by client is not taken, fill username string.
+            check_username(&state, &mut username, &name);
 
-            // // If username that is sent by client is not taken, fill username string.
-            // check_username(&state, &mut username, &name);
-
-            // // If not empty we want to quit the loop else we want to quit function.
-            // if !username.is_empty() {
-            //     break;
-            // } else {
-            //     // Only send our client that username is taken.
-            //     let _ = ub_tx.send(Ok(Message::Text(String::from("Username already taken."))));
-            //     return;
-            // }
+            // If not empty we want to quit the loop else we want to quit function.
+            if !username.is_empty() {
+                break;
+            } else {
+                // Only send our client that username is taken.
+                let _ = ub_tx.send(Ok(Message::Text(String::from("Username already taken."))));
+                return;
+            }
         }
     }
 
