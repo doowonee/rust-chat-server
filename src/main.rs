@@ -39,7 +39,9 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::protocol::{AuthRequest, PacketKind, Ping, Request, SendTextRequest};
+use crate::protocol::{
+    AuthRequest, EnterRoomRequest, LeaveRoomRequest, PacketKind, Ping, Request, SendTextRequest,
+};
 
 // Our shared state
 pub struct AppState {
@@ -182,18 +184,31 @@ async fn index() -> Html<&'static str> {
 async fn on_tx(
     sid: String,
     redis_subscriber: SubscriberClient,
-    _state: Arc<AppState>,
+    state: Arc<AppState>,
     ws_tx: WebsocketTx,
 ) {
     let mut message_stream = redis_subscriber.on_message();
     while let Some((channel, message)) = message_stream.next().await {
+        let json: serde_json::Value =
+            serde_json::from_str(&message.as_str().unwrap_or_default()).unwrap_or_default();
         tracing::debug!("세션 {} 수신 {:?} on channel {}", sid, message, channel);
-        // @TODO 레디스로 받은 메시지는 전체 전파 용이므로 일단 전체 전파 나중에 채팅방 개념 생기면 그때 필터링
-        if ws_tx
-            .send(Ok(Message::Text(message.as_string().unwrap_or_default())))
-            .is_err()
-        {
-            break;
+
+        let sessions = state.sessions.lock().unwrap();
+        match sessions.get(&sid) {
+            Some(session) => {
+                if session.is_joined(json["r"].as_str().unwrap_or_default()) {
+                    // @TODO 레디스로 받은 메시지는 전체 전파 용이므로 일단 전체 전파 나중에 채팅방 개념 생기면 그때 필터링
+                    if ws_tx
+                        .send(Ok(Message::Text(message.as_string().unwrap_or_default())))
+                        .is_err()
+                    {
+                        break;
+                    }
+                } else {
+                    tracing::debug!("세션 {} 조인된 채팅방이 아니라서 송신 안함", sid);
+                }
+            }
+            None => break,
         }
     }
 }
@@ -243,6 +258,28 @@ async fn on_rx(sid: String, state: Arc<AppState>, ws_tx: WebsocketTx, mut ws_rx:
                         Ok(v) => v,
                         Err(e) => {
                             tracing::error!("Wrong SendTextRequest: {} payload: {}", e, payload);
+                            return;
+                        }
+                    };
+
+                    req.handle(sid.clone(), ws_tx.clone(), state.clone()).await;
+                }
+                PacketKind::EnterRoomRequest => {
+                    let req: EnterRoomRequest = match serde_json::from_value(packet.payload) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::error!("Wrong EnterRoomRequest: {} payload: {}", e, payload);
+                            return;
+                        }
+                    };
+
+                    req.handle(sid.clone(), ws_tx.clone(), state.clone()).await;
+                }
+                PacketKind::LeaveRoomRequest => {
+                    let req: LeaveRoomRequest = match serde_json::from_value(packet.payload) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::error!("Wrong LeaveRoomRequest: {} payload: {}", e, payload);
                             return;
                         }
                     };

@@ -28,6 +28,13 @@ pub enum PacketKind {
     SendTextSuccess = 102,
     /// 인증 정보 누락으로 실패 처리
     SendTextFail = 103,
+    /// 채팅방 입장
+    EnterRoomRequest = 181,
+    EnterRoomSuccess = 182,
+    EnterRoomFail = 183,
+    LeaveRoomRequest = 191,
+    LeaveRoomSuccess = 192,
+    LeaveRoomFail = 193,
 }
 
 // @TODO 응답에 op_code 추가
@@ -142,6 +149,8 @@ impl AuthRequest {
 pub struct SendTextRequest {
     #[serde(rename = "c")]
     pub content: String,
+    #[serde(rename = "r")]
+    pub room_id: String,
 }
 
 impl SendTextRequest {
@@ -158,6 +167,7 @@ impl SendTextRequest {
                         let json = serde_json::json!({
                             "o": PacketKind::SendTextSuccess,
                             "c": self.content,
+                            "r": self.room_id,
                             "n": u.name,
                             "i": u.id,
                         });
@@ -196,6 +206,120 @@ impl SendTextRequest {
                 tracing::error!("SendTextRequest 실패: 세션 정보에 해당 세션이 없음 {}", sid);
                 let json = serde_json::json!({
                     "o": PacketKind::SendTextFail,
+                    "s": sid,
+                });
+                let msg = format!("{}", json);
+                // 송신자에게만 전파
+                let _ = tx.send(Ok(Message::Text(msg)));
+            }
+        };
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct EnterRoomRequest {
+    #[serde(rename = "r")]
+    pub room_id: String,
+}
+
+impl EnterRoomRequest {
+    /// 요청 패킷 처리
+    pub async fn handle(&self, sid: String, tx: WebsocketTx, state: Arc<AppState>) {
+        // 함수가 끝나면 자동 lock 해제
+        let mut sessions = state.sessions.lock().unwrap();
+
+        match sessions.get_mut(&sid) {
+            Some(v) => {
+                match v.user() {
+                    Some(_) => {
+                        // 인증 된 세션이라 입장 허용
+                        let json = serde_json::json!({
+                            "o": PacketKind::EnterRoomSuccess,
+                            "r": self.room_id,
+                        });
+                        let msg = format!("{}", json);
+
+                        v.join(&self.room_id);
+                        // 송신자에게만 전파
+                        let _ = tx.send(Ok(Message::Text(msg)));
+                    }
+                    None => {
+                        // 인증 안되서 전파 실패 처리
+                        tracing::error!("인증 안된 세션이라 입장 실패 {}", sid);
+                        let json = serde_json::json!({
+                            "o": PacketKind::EnterRoomFail,
+                            "r": self.room_id,
+                        });
+                        let msg = format!("{}", json);
+                        // 송신자에게만 전파
+                        let _ = tx.send(Ok(Message::Text(msg)));
+                    }
+                }
+            }
+            None => {
+                tracing::error!(
+                    "EnterRoomRequest 실패: 세션 정보에 해당 세션이 없음 {}",
+                    sid
+                );
+                let json = serde_json::json!({
+                    "o": PacketKind::EnterRoomFail,
+                    "s": sid,
+                });
+                let msg = format!("{}", json);
+                // 송신자에게만 전파
+                let _ = tx.send(Ok(Message::Text(msg)));
+            }
+        };
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct LeaveRoomRequest {
+    #[serde(rename = "r")]
+    pub room_id: String,
+}
+
+impl LeaveRoomRequest {
+    /// 요청 패킷 처리
+    pub async fn handle(&self, sid: String, tx: WebsocketTx, state: Arc<AppState>) {
+        // 함수가 끝나면 자동 lock 해제
+        let mut sessions = state.sessions.lock().unwrap();
+
+        match sessions.get_mut(&sid) {
+            Some(v) => {
+                match v.user() {
+                    Some(_) => {
+                        // 인증 된 세션이라 퇴장 허용
+                        let json = serde_json::json!({
+                            "o": PacketKind::LeaveRoomSuccess,
+                            "r": self.room_id,
+                        });
+                        let msg = format!("{}", json);
+
+                        v.leave(&self.room_id);
+                        // 송신자에게만 전파
+                        let _ = tx.send(Ok(Message::Text(msg)));
+                    }
+                    None => {
+                        // 인증 안되서 전파 실패 처리
+                        tracing::error!("인증 안된 세션이라 퇴장 실패 {}", sid);
+                        let json = serde_json::json!({
+                            "o": PacketKind::LeaveRoomFail,
+                            "r": self.room_id,
+                        });
+                        let msg = format!("{}", json);
+                        // 송신자에게만 전파
+                        let _ = tx.send(Ok(Message::Text(msg)));
+                    }
+                }
+            }
+            None => {
+                tracing::error!(
+                    "LeaveRoomRequest 실패: 세션 정보에 해당 세션이 없음 {}",
+                    sid
+                );
+                let json = serde_json::json!({
+                    "o": PacketKind::LeaveRoomFail,
                     "s": sid,
                 });
                 let msg = format!("{}", json);
