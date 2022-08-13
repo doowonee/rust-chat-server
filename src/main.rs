@@ -32,10 +32,7 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
-use tokio::sync::{
-    broadcast,
-    mpsc::{self, UnboundedSender},
-};
+use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -47,7 +44,6 @@ pub struct AppState {
     sessions: Mutex<BTreeMap<String, Session>>,
     /// 유저 아이디를 키로하고 세션 아이디를 값으로 하는 트리맵
     users: Mutex<BTreeMap<String, String>>,
-    tx: broadcast::Sender<String>,
     redis_client: RedisClient,
     redis_subscriber: SubscriberClient,
 }
@@ -66,9 +62,6 @@ async fn main() {
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
-
-    // 서버 내부 메모리 에서 유저풀 관리
-    let (tx, _rx) = broadcast::channel(100);
 
     // Redis 클라이언트 준비
     let config = RedisConfig::default();
@@ -95,7 +88,6 @@ async fn main() {
     let app_state = Arc::new(AppState {
         sessions,
         users,
-        tx,
         redis_client,
         redis_subscriber,
     });
@@ -123,7 +115,7 @@ async fn websocket_handler(
 async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
     tracing::debug!("{} 연결 수립", sid);
     // By splitting we can send and receive at the same time.
-    let (mut sender, mut receiver) = stream.split();
+    let (sender, mut receiver) = stream.split();
 
     // Use an unbounded channel to handle buffering and flushing of messages
     // to the websocket...K

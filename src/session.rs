@@ -45,5 +45,5 @@ pub struct User {
 
 pub fn add_session(state: &AppState, sid: &str, tx: WebsocketTx) {
     let mut sessions = state.sessions.lock().unwrap();
-    sessions.insert(sid.to_owned(), Session::new(&sid, tx));
+    sessions.insert(sid.to_owned(), Session::new(sid, tx));
 }

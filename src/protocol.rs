@@ -6,13 +6,12 @@
 
 use std::sync::Arc;
 
-use axum::{extract::ws::Message, Error};
+use axum::extract::ws::Message;
 use chrono::prelude::*;
 use fred::prelude::PubsubInterface;
 use num_enum::TryFromPrimitive;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
-use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{session::User, AppState, WebsocketTx, REDIS_CHANNEL_NAME};
 
@@ -65,7 +64,7 @@ pub struct Ping {
 
 impl Ping {
     /// 요청 패킷 처리
-    pub async fn handle(&self, sid: String, tx: WebsocketTx, now: NaiveDateTime) {
+    pub async fn handle(&self, _sid: String, tx: WebsocketTx, now: NaiveDateTime) {
         let json = serde_json::json!({
             "o": PacketKind::Pong,
             "t1": &self.client_epoch,
