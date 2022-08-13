@@ -4,6 +4,8 @@ use axum::{extract::ws::Message, Error};
 use bson::oid::ObjectId;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::{AppState, WebsocketTx};
+
 pub fn generate_id() -> String {
     format!("ws{}", ObjectId::new())
 }
@@ -39,4 +41,9 @@ impl Session {
 pub struct User {
     pub id: String,
     pub name: String,
+}
+
+pub fn add_session(state: &AppState, sid: &str, tx: WebsocketTx) {
+    let mut sessions = state.sessions.lock().unwrap();
+    sessions.insert(sid.to_owned(), Session::new(&sid, tx));
 }

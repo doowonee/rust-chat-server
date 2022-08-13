@@ -17,7 +17,7 @@ use axum::{
     },
     response::{Html, IntoResponse},
     routing::get,
-    Router,
+    Error, Router,
 };
 use chrono::prelude::*;
 use fred::{
@@ -32,7 +32,10 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{
+    broadcast,
+    mpsc::{self, UnboundedSender},
+};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -51,6 +54,9 @@ pub struct AppState {
 
 /// pub sub 대상 채널 이름
 pub const REDIS_CHANNEL_NAME: &str = "zxc";
+
+/// ubounded channel 로 웹소켓 송신 채널로 포워딩 된다
+pub type WebsocketTx = UnboundedSender<Result<Message, Error>>;
 
 #[tokio::main]
 async fn main() {
@@ -134,10 +140,7 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
     }));
 
     // 세션 정보에 웹소켓 송신 스트림 정보를 넣는다
-    let mut sessions = state.sessions.lock().unwrap();
-    sessions.insert(sid.clone(), Session::new(&sid, ub_tx.clone()));
-    // 함수가 끝나야 drop 되므로 명시적으로 락 해제 한다
-    drop(sessions);
+    session::add_session(&state, &sid, ub_tx.clone());
 
     // Username gets set in the receive loop, if it's valid.
     let mut username = String::new();
