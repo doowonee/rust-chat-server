@@ -4,14 +4,9 @@
 //! op_code를 enum 화 하여 optional 한 필드로 단일 struct
 //! 가 아니라 enum 즉 프로토콜 타입별로 struct를 사용
 
-use std::sync::Arc;
-
-use chrono::prelude::*;
 use num_enum::TryFromPrimitive;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
-
-use crate::AppState;
 
 /// 프로토콜
 #[derive(Debug, TryFromPrimitive, Serialize_repr, Deserialize_repr)]
@@ -48,17 +43,18 @@ pub struct Ping {
     pub client_epoch: i64,
 }
 
-impl Ping {
-    /// 요청 패킷 처리
-    pub async fn handle(&self, now: NaiveDateTime) -> String {
-        let json = serde_json::json!({
-            "o": PacketKind::Pong,
-            "t1": &self.client_epoch,
-            "t2": now.timestamp_millis(),
-            "t3": Utc::now().timestamp_millis(),
-        });
-        format!("{}", json)
-    }
+/// 통신 상태 체크 응답
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Pong {
+    /// epoch from client
+    #[serde(rename = "t1")]
+    pub client_epoch: i64,
+    /// epoch when received from client
+    #[serde(rename = "t2")]
+    pub received_epoch: i64,
+    /// epoch when send from server
+    #[serde(rename = "t3")]
+    pub server_epoch: i64,
 }
 
 /// 인증 요청
@@ -70,30 +66,20 @@ pub struct AuthRequest {
     pub user_id: String,
 }
 
-impl AuthRequest {
-    /// 요청 패킷 처리
-    pub async fn handle(&self, sid: &str, state: &Arc<AppState>) -> String {
-        // 함수가 끝나면 자동 lock 해제
-        let mut user_set = state.user_set.lock().unwrap();
+/// 인증 성공
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AuthSuccess {
+    #[serde(rename = "n")]
+    pub user_name: String,
+    #[serde(rename = "i")]
+    pub user_id: String,
+    #[serde(rename = "s")]
+    pub session_id: String,
+}
 
-        // 일단 중복 아이디일 경우 인증 실패 처리
-        let json = if !user_set.contains(&self.user_id) {
-            user_set.insert(self.user_id.to_owned());
-            serde_json::json!({
-                "o": PacketKind::AuthSuccess,
-                "n": self.user_name,
-                "i": self.user_id,
-                "s": sid,
-            })
-        } else {
-            tracing::error!("테스트용 인증 실패 {}", sid);
-            serde_json::json!({
-                "o": PacketKind::AuthFail,
-                "n": self.user_name,
-                "i": self.user_id,
-                "s": sid,
-            })
-        };
-        format!("{}", json)
-    }
+/// 인증 실패
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AuthFail {
+    #[serde(rename = "s")]
+    pub session_id: String,
 }

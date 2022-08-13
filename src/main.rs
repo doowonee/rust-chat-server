@@ -40,10 +40,10 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::protocol::{AuthRequest, Packet, PacketKind, Ping};
+use crate::protocol::{AuthFail, AuthRequest, AuthSuccess, Packet, PacketKind, Ping, Pong};
 
 // Our shared state
-pub struct AppState {
+struct AppState {
     user_set: Mutex<HashSet<String>>,
     /// 세션 아이디를 키로 하고 웹소켓 송신 스트림을 값으로 하는 트리맵
     websocket_sessions: Mutex<BTreeMap<String, SplitSink<WebSocket, Message>>>,
@@ -120,7 +120,7 @@ async fn websocket_handler(
 }
 
 async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
-    tracing::debug!("{} 연결 수립", sid);
+    tracing::debug!("{} 연결됌", sid);
     // By splitting we can send and receive at the same time.
     let (mut sender, mut receiver) = stream.split();
 
@@ -143,15 +143,15 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
     // Loop until a text message is found.
     while let Some(Ok(message)) = receiver.next().await {
         if let Message::Text(payload) = message {
-            let now = Utc::now().naive_utc();
             tracing::debug!("수신 패킷 {}", payload);
+            let received_epoch = Utc::now().timestamp_millis();
             // return statement means close the connection
 
             // check packet format
             let packet: Packet = match serde_json::from_str(&payload) {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::error!("Wrong JSON: {} payload: {}", e, payload);
+                    tracing::error!("wrong json: {} payload: {}", e, payload);
                     return;
                 }
             };
@@ -162,28 +162,54 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
                     let req: Ping = match serde_json::from_value(packet.payload) {
                         Ok(v) => v,
                         Err(e) => {
-                            tracing::error!("Wrong Ping: {} payload: {}", e, payload);
+                            tracing::error!("wrong ping: {} payload: {}", e, payload);
                             return;
                         }
                     };
 
-                    let res = req.handle(now).await;
-                    let _ = ub_tx.send(Ok(Message::Text(res)));
+                    // send pong to client
+                    let res = Pong {
+                        client_epoch: req.client_epoch,
+                        received_epoch,
+                        server_epoch: Utc::now().timestamp_millis(),
+                    };
+                    let _ = ub_tx.send(Ok(Message::Text(
+                        serde_json::to_string(&res).unwrap_or_default(),
+                    )));
                 }
                 PacketKind::AuthRequest => {
                     let req: AuthRequest = match serde_json::from_value(packet.payload) {
                         Ok(v) => v,
                         Err(e) => {
-                            tracing::error!("Wrong AuthRequest: {} payload: {}", e, payload);
+                            tracing::error!("wrong AuthRequest: {} payload: {}", e, payload);
                             return;
                         }
                     };
 
-                    let res = req.handle(&sid, &state).await;
-                    let _ = ub_tx.send(Ok(Message::Text(res)));
+                    match authenticate(&state, &sid, &req.user_id) {
+                        Ok(_) => {
+                            let res = AuthSuccess {
+                                user_name: req.user_name,
+                                user_id: req.user_id,
+                                session_id: sid.clone(),
+                            };
+                            let _ = ub_tx.send(Ok(Message::Text(
+                                serde_json::to_string(&res).unwrap_or_default(),
+                            )));
+                        }
+                        Err(e) => {
+                            tracing::error!("인증 실패: {}", e);
+                            let res = AuthFail {
+                                session_id: sid.clone(),
+                            };
+                            let _ = ub_tx.send(Ok(Message::Text(
+                                serde_json::to_string(&res).unwrap_or_default(),
+                            )));
+                        }
+                    };
                 }
                 _ => {
-                    tracing::error!("{:?} Wrong Request {}", packet.op_code, payload);
+                    tracing::error!("{:?} wrong request {}", packet.op_code, payload);
                     return;
                 }
             };
@@ -193,16 +219,16 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
     // Subscribe before sending joined message.
     let mut rx = state.tx.subscribe();
 
-    // // Send joined message to all subscribers.
-    // let msg = format!("{} joined.", username);
-    // tracing::debug!("{}", msg);
-    // let redis_client = state.redis_client.clone();
-    // // @TODO unwrap 에러시 몇번 재시도 하고 에러로 취급
-    // let received_clients: i64 = redis_client
-    //     .publish(REDIS_CHANNEL_NAME, &msg)
-    //     .await
-    //     .unwrap();
-    // tracing::debug!("redis publish: {}", received_clients);
+    // Send joined message to all subscribers.
+    let msg = format!("{} joined.", username);
+    tracing::debug!("{}", msg);
+    let redis_client = state.redis_client.clone();
+    // @TODO unwrap 에러시 몇번 재시도 하고 에러로 취급
+    let received_clients: i64 = redis_client
+        .publish(REDIS_CHANNEL_NAME, &msg)
+        .await
+        .unwrap();
+    tracing::debug!("redis publish: {}", received_clients);
     // let _ = state.tx.send(msg);
 
     // This task will receive broadcast messages and send text message to our client.
@@ -276,20 +302,33 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
     };
 
     // Send user left message.
-    tracing::debug!("{} 연결 종료", sid);
-    // let msg = format!("{} left.", username);
-    // tracing::debug!("{}", msg);
-    // let redis_client = state.redis_client.clone();
-    // // @TODO unwrap 에러시 몇번 재시도 하고 에러로 취급
-    // let received_clients: i64 = redis_client
-    //     .publish(REDIS_CHANNEL_NAME, &msg)
-    //     .await
-    //     .unwrap();
-    // tracing::debug!("redis publish: {}", received_clients);
-    // // let _ = state.tx.send(msg);
+    let msg = format!("{} left.", username);
+    tracing::debug!("{}", msg);
+    let redis_client = state.redis_client.clone();
+    // @TODO unwrap 에러시 몇번 재시도 하고 에러로 취급
+    let received_clients: i64 = redis_client
+        .publish(REDIS_CHANNEL_NAME, &msg)
+        .await
+        .unwrap();
+    tracing::debug!("redis publish: {}", received_clients);
+    // let _ = state.tx.send(msg);
 
-    // // Remove username from map so new clients can take it.
-    // state.user_set.lock().unwrap().remove(&username);
+    // Remove username from map so new clients can take it.
+    state.user_set.lock().unwrap().remove(&username);
+}
+
+fn authenticate(state: &AppState, sid: &str, user_id: &str) -> Result<(), Error> {
+    // 함수가 끝나면 자동 lock 해제
+    let mut user_set = state.user_set.lock().unwrap();
+
+    // 일단 중복 아이디일 경우 인증 실패 처리
+    if !user_set.contains(user_id) {
+        user_set.insert(user_id.to_owned());
+        Ok(())
+    } else {
+        let msg = format!("테스트용 인증 실패 {}", sid);
+        Err(Error::Unknown(msg))
+    }
 }
 
 // Include utf-8 file at **compile** time.
