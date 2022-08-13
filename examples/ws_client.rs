@@ -84,6 +84,11 @@ pub async fn run_test(status: Arc<Mutex<Status>>) {
         rand::random::<i64>()
     );
     write.send(Message::from(msg)).await.unwrap();
+    // 채팅방 조인
+    write
+        .send(Message::from(r#"{"o":181,"r":"room_id"}"#))
+        .await
+        .unwrap();
 
     // 0.3초 마다 랜덤 숫자 넣은 채팅 전송
     let cloned_status = status.clone();
@@ -92,7 +97,7 @@ pub async fn run_test(status: Arc<Mutex<Status>>) {
         loop {
             interval.tick().await;
             let msg = format!(
-                r#"{{"o":101,"c":"{} 안녕 나는 {} 이야"}}"#,
+                r#"{{"o":101, "r":"room_id", "c":"{} 안녕 나는 {} 이야"}}"#,
                 rand::random::<i64>(),
                 rand::random::<i64>()
             );

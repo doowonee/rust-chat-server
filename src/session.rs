@@ -1,5 +1,7 @@
 //! websocket session
 
+use std::collections::BTreeSet;
+
 use axum::{extract::ws::Message, Error};
 use bson::oid::ObjectId;
 use tokio::sync::mpsc::UnboundedSender;
@@ -15,6 +17,7 @@ pub struct Session {
     id: String,
     tx: UnboundedSender<Result<Message, Error>>,
     user_info: Option<User>,
+    rooms: BTreeSet<String>,
 }
 
 impl Session {
@@ -23,6 +26,7 @@ impl Session {
             id: sid.into(),
             tx,
             user_info: None,
+            rooms: BTreeSet::new(),
         }
     }
 
@@ -34,6 +38,21 @@ impl Session {
     /// 유저정보 조회
     pub fn user(&self) -> Option<&User> {
         self.user_info.as_ref()
+    }
+
+    /// room에 조인
+    pub fn join(&mut self, room_id: &str) {
+        self.rooms.insert(room_id.to_owned());
+    }
+
+    /// room에 에서 제거
+    pub fn leave(&mut self, room_id: &str) {
+        self.rooms.remove(room_id);
+    }
+
+    /// room에 조인
+    pub fn is_joined(&self, room_id: &str) -> bool {
+        self.rooms.contains(room_id)
     }
 }
 
