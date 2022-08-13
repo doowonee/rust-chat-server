@@ -9,13 +9,16 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::time::{self, sleep};
+use tokio::time;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const WS_ENDPOINT: &str = "ws://localhost:3000/websocket";
 
 #[derive(Debug)]
 pub struct Status(pub i64, pub i64, pub u32);
+
+const CLIENT_CREATING_PERIOD: u64 = 5;
+const CHAT_CREATING_PERIOD: u64 = 60000;
 
 #[tokio::main]
 async fn main() {
@@ -41,7 +44,7 @@ async fn main() {
 
     for _ in 1..999999 {
         // 0.1 초씩 클라이언트 증가
-        time::sleep(Duration::from_millis(500)).await;
+        time::sleep(Duration::from_millis(CLIENT_CREATING_PERIOD)).await;
         let cloned_status = status.clone();
         let h = tokio::spawn(async move {
             run_test(cloned_status.clone()).await;
@@ -70,6 +73,7 @@ pub async fn run_test(status: Arc<Mutex<Status>>) {
     let cloned_status = status.clone();
     let recv_task = tokio::spawn(async move {
         while let Some(Ok(_msg)) = read.next().await {
+            // info!("수신 {:?}", msg);
             cloned_status.lock().unwrap().0 += 1;
         }
     });
@@ -84,7 +88,7 @@ pub async fn run_test(status: Arc<Mutex<Status>>) {
     // 0.3초 마다 랜덤 숫자 넣은 채팅 전송
     let cloned_status = status.clone();
     let send_task = tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_millis(300));
+        let mut interval = time::interval(Duration::from_millis(CHAT_CREATING_PERIOD));
         loop {
             interval.tick().await;
             let msg = format!(
