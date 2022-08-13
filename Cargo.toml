@@ -9,10 +9,8 @@ edition = "2021"
 axum = { version = "0.5", features = ["ws"] }
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1.9"
 tower = { version = "0.4", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fred = { version = "5.1", features = ["subscriber-client"] }
-bson = "2"
 # thiserror = "1.0.32"

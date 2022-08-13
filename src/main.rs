@@ -6,8 +6,6 @@
 //! cd examples && cargo run -p example-chat
 //! ```
 
-mod session;
-
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -22,27 +20,18 @@ use fred::{
     prelude::*,
     types::{ReconnectPolicy, RedisConfig},
 };
-use futures::{
-    sink::SinkExt,
-    stream::{SplitSink, StreamExt},
-    FutureExt,
-};
+use futures::{sink::SinkExt, stream::StreamExt};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
-use tokio::sync::{broadcast, mpsc};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio::sync::broadcast;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // Our shared state
 struct AppState {
     user_set: Mutex<HashSet<String>>,
-    /// 세션 아이디를 키로 하고 웹소켓 송신 스트림을 값으로 하는 트리맵
-    websocket_sessions: Mutex<BTreeMap<String, SplitSink<WebSocket, Message>>>,
-    // /// 세션 아이디를 키 유저 아디 정보를 담은 트리맵
-    // websocket_sessions: Mutex<BTreeMap<String, String>>,
     tx: broadcast::Sender<String>,
     redis_client: RedisClient,
     redis_subscriber: SubscriberClient,
@@ -83,11 +72,9 @@ async fn main() {
         .unwrap();
     tracing::info!("redis subscribe 완료");
 
-    let websocket_sessions = Mutex::new(BTreeMap::new());
     // 웹 서버 핸들러간 공유
     let app_state = Arc::new(AppState {
         user_set,
-        websocket_sessions,
         tx,
         redis_client,
         redis_subscriber,
@@ -110,27 +97,12 @@ async fn websocket_handler(
     ws: WebSocketUpgrade,
     Extension(state): Extension<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| websocket(socket, state, session::generate_id()))
+    ws.on_upgrade(|socket| websocket(socket, state))
 }
 
-async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
-    tracing::debug!("{} 연결됌", sid);
+async fn websocket(stream: WebSocket, state: Arc<AppState>) {
     // By splitting we can send and receive at the same time.
     let (mut sender, mut receiver) = stream.split();
-
-    // Use an unbounded channel to handle buffering and flushing of messages
-    // to the websocket...K
-    let (ub_tx, ub_rx) = mpsc::unbounded_channel();
-    // tokio 의 unbound 채널을 future의 Stream trait 을 지원하는 스트림으로 변환 한다.
-    let ub_rx = UnboundedReceiverStream::new(ub_rx);
-    // tokio 비동기 태스크로 future의 스트림을 웹소켓 송신 채널로 포워딩 해준다
-    tokio::spawn(ub_rx.forward(sender).map(move |result| {
-        if let Err(e) = result {
-            // Connection closed normally 라고 찍힘
-            tracing::error!("websocket send error: {}", e);
-            // cloned_disconnected_event_tx.send(()).unwrap();
-        }
-    }));
 
     // Username gets set in the receive loop, if it's valid.
     let mut username = String::new();
@@ -145,7 +117,10 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
                 break;
             } else {
                 // Only send our client that username is taken.
-                let _ = ub_tx.send(Ok(Message::Text(String::from("Username already taken."))));
+                let _ = sender
+                    .send(Message::Text(String::from("Username already taken.")))
+                    .await;
+
                 return;
             }
         }
@@ -182,19 +157,13 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
         let mut message_stream = redis_subscriber.on_message();
         while let Some((channel, message)) = message_stream.next().await {
             tracing::debug!("Recv {:?} on channel {}", message, channel);
-            if ub_tx
-                .send(Ok(Message::Text(message.as_string().unwrap_or_default())))
+            if sender
+                .send(Message::Text(message.as_string().unwrap_or_default()))
+                .await
                 .is_err()
             {
                 break;
             }
-            // if sender
-            //     .send(Message::Text(message.as_string().unwrap_or_default()))
-            //     .await
-            //     .is_err()
-            // {
-            //     break;
-            // }
         }
         Ok::<_, RedisError>(())
     });
