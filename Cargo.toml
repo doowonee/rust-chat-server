@@ -13,7 +13,7 @@ tokio-stream = "0.1.9"
 tower = { version = "0.4", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-fred = { version = "5.1", features = ["subscriber-client"] }
+redis = { version = "0.21.5", features = ["aio", "tokio-comp"] }
 bson = "2"
 thiserror = "1.0.32"
 serde = "1"
