@@ -17,7 +17,6 @@ pub struct Session {
     id: String,
     tx: UnboundedSender<Result<Message, Error>>,
     user_info: Option<User>,
-    rooms: BTreeSet<String>,
 }
 
 impl Session {
@@ -26,7 +25,6 @@ impl Session {
             id: sid.into(),
             tx,
             user_info: None,
-            rooms: BTreeSet::new(),
         }
     }
 
@@ -40,19 +38,9 @@ impl Session {
         self.user_info.as_ref()
     }
 
-    /// room에 조인
-    pub fn join(&mut self, room_id: &str) {
-        self.rooms.insert(room_id.to_owned());
-    }
-
-    /// room에 에서 제거
-    pub fn leave(&mut self, room_id: &str) {
-        self.rooms.remove(room_id);
-    }
-
-    /// room에 조인
-    pub fn is_joined(&self, room_id: &str) -> bool {
-        self.rooms.contains(room_id)
+    /// 해당 세션으로 데이터 송신
+    pub fn send(&self, msg: String) {
+        let _ = self.tx.send(Ok(Message::Text(msg)));
     }
 }
 

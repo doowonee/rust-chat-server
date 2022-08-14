@@ -31,7 +31,7 @@ use futures::{
 };
 use session::Session;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
@@ -49,6 +49,8 @@ pub struct AppState {
     sessions: Mutex<BTreeMap<String, Session>>,
     /// 유저 아이디를 키로하고 세션 아이디를 값으로 하는 트리맵
     users: Mutex<BTreeMap<String, String>>,
+    /// 채팅방 아이디를 키로하고 세션 아디 셋을 값으로 하는 트리맵
+    rooms: Mutex<BTreeMap<String, BTreeSet<String>>>,
     redis_client: RedisClient,
     redis_subscriber: SubscriberClient,
 }
@@ -91,13 +93,18 @@ async fn main() {
 
     let sessions = Mutex::new(BTreeMap::new());
     let users = Mutex::new(BTreeMap::new());
+    let rooms = Mutex::new(BTreeMap::new());
     // 웹 서버 핸들러간 공유
     let app_state = Arc::new(AppState {
         sessions,
         users,
+        rooms,
         redis_client,
         redis_subscriber,
     });
+
+    // 웹 소켓 수신 세션별로 subscirbe가 아니라 단일 레디스 수신 핸들러임
+    let _redis_reieve_handler = tokio::spawn(on_message(app_state.clone()));
 
     let app = Router::new()
         .route("/", get(index))
@@ -141,26 +148,14 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
     session::add_session(&state, &sid, ub_tx.clone());
 
     tracing::debug!("redis subscribe 준비");
-    // redis subscribe 한 데이터를 웹소켓으로 전송
-    let mut send_task = tokio::spawn(on_tx(
-        sid.clone(),
-        state.redis_subscriber.clone(),
-        state.clone(),
-        ub_tx.clone(),
-    ));
-    tracing::debug!("redis subscribe 블록 벗어남");
 
     // This task will receive messages from client and send them to broadcast subscribers.
     // 웹소켓으로 부터 데이터를 수신하면 redis로 publish
-    let mut recv_task = tokio::spawn(on_rx(sid.clone(), state.clone(), ub_tx.clone(), receiver));
+    let recv_task = tokio::spawn(on_rx(sid.clone(), state.clone(), ub_tx.clone(), receiver));
+    // 클라가 연결으르 종료하지 않는 이상 수신 소켓 핸들러가 무한루프로 실행된다
+    recv_task.await.unwrap();
 
-    // If any one of the tasks exit, abort the other.
-    tokio::select! {
-        _ = (&mut send_task) => recv_task.abort(),
-        _ = (&mut recv_task) => send_task.abort(),
-    };
-
-    // Send user left message.
+    // 클라 사이드에서 연결 강제 종료 된것으로 세션 정보 삭제
     // 연결 종료시 세션 정보 삭제
     let mut sessions = state.sessions.lock().unwrap();
     match sessions.get(&sid) {
@@ -188,34 +183,38 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("../static/chat.html"))
 }
 
-async fn on_tx(
-    sid: String,
-    redis_subscriber: SubscriberClient,
-    state: Arc<AppState>,
-    ws_tx: WebsocketTx,
-) {
+/// 레디스로 부터 subscribe 될 때
+async fn on_message(state: Arc<AppState>) {
+    let redis_subscriber = state.redis_subscriber.clone();
     let mut message_stream = redis_subscriber.on_message();
     while let Some((channel, message)) = message_stream.next().await {
         let json: serde_json::Value =
             serde_json::from_str(&message.as_str().unwrap_or_default()).unwrap_or_default();
-        tracing::debug!("세션 {} 수신 {:?} on channel {}", sid, message, channel);
-
+        let room_id = json["r"].as_str().unwrap_or_default();
+        tracing::debug!("on_message 수신 {:?} on channel {}", message, channel);
+        let rooms = state.rooms.lock().unwrap();
         let sessions = state.sessions.lock().unwrap();
-        match sessions.get(&sid) {
-            Some(session) => {
-                if session.is_joined(json["r"].as_str().unwrap_or_default()) {
-                    // @TODO 레디스로 받은 메시지는 전체 전파 용이므로 일단 전체 전파 나중에 채팅방 개념 생기면 그때 필터링
-                    if ws_tx
-                        .send(Ok(Message::Text(message.as_string().unwrap_or_default())))
-                        .is_err()
-                    {
-                        break;
+        match rooms.get(room_id) {
+            Some(sessions_in_room) => {
+                for session_id in sessions_in_room {
+                    match sessions.get(session_id) {
+                        Some(session) => {
+                            // 해당 세션 웹소켓 송신용 스트림으로 메시지 송신
+                            session.send(message.as_string().unwrap_or_default());
+                        }
+                        None => {
+                            tracing::warn!(
+                                "on_message 없는 세션 {} 송신 못했음 {:?}",
+                                session_id,
+                                message
+                            );
+                        }
                     }
-                } else {
-                    tracing::debug!("세션 {} 조인된 채팅방이 아니라서 송신 안함", sid);
                 }
             }
-            None => break,
+            None => {
+                tracing::warn!("on_message 없는 room id 임 그냥 무시 {:?}", message);
+            }
         }
     }
 }

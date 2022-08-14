@@ -4,7 +4,7 @@
 //! op_code를 enum 화 하여 optional 한 필드로 단일 struct
 //! 가 아니라 enum 즉 프로토콜 타입별로 struct를 사용
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use axum::extract::ws::Message;
 use chrono::prelude::*;
@@ -158,7 +158,23 @@ impl SendTextRequest {
     pub async fn handle(&self, sid: String, tx: WebsocketTx, state: Arc<AppState>) {
         // 함수가 끝나면 자동 lock 해제
         let sessions = state.sessions.lock().unwrap();
+        let rooms = state.rooms.lock().unwrap();
 
+        if !rooms.contains_key(&self.room_id) {
+            // 존재 하지 않는 채팅방이므로 실패 처리
+            // 누군가 입장이 되어있는 상태여야 전파 가능함
+            // 인증 안되서 전파 실패 처리
+            // @TODO 서버 클러스터 기능을 위해 이건 정보들은 레디스에 중앙에서 관리해야함
+            tracing::error!("존재 하지 않는 채팅방이라 전파 실패 {} {:?}", sid, self);
+            let json = serde_json::json!({
+                "o": PacketKind::SendTextFail,
+                "s": sid,
+            });
+            let msg = format!("{}", json);
+            // 송신자에게만 전파
+            let _ = tx.send(Ok(Message::Text(msg)));
+            return;
+        }
         match sessions.get(&sid) {
             Some(v) => {
                 match v.user() {
@@ -226,50 +242,46 @@ impl EnterRoomRequest {
     /// 요청 패킷 처리
     pub async fn handle(&self, sid: String, tx: WebsocketTx, state: Arc<AppState>) {
         // 함수가 끝나면 자동 lock 해제
-        let mut sessions = state.sessions.lock().unwrap();
+        let sessions = state.sessions.lock().unwrap();
+        let mut rooms = state.rooms.lock().unwrap();
 
-        match sessions.get_mut(&sid) {
-            Some(v) => {
-                match v.user() {
-                    Some(_) => {
-                        // 인증 된 세션이라 입장 허용
-                        let json = serde_json::json!({
-                            "o": PacketKind::EnterRoomSuccess,
-                            "r": self.room_id,
-                        });
-                        let msg = format!("{}", json);
+        if sessions
+            .get(&sid)
+            .map(|v| v.user().is_none())
+            .unwrap_or(false)
+        {
+            // 인증 안된 세션이므로 입장 거부 처리
+            tracing::error!("인증 안된 세션이라 입장 실패 {}", sid);
+            let json = serde_json::json!({
+                "o": PacketKind::EnterRoomFail,
+                "r": self.room_id,
+            });
+            let msg = format!("{}", json);
+            // 송신자에게만 전파
+            let _ = tx.send(Ok(Message::Text(msg)));
+            return;
+        }
 
-                        v.join(&self.room_id);
-                        // 송신자에게만 전파
-                        let _ = tx.send(Ok(Message::Text(msg)));
-                    }
-                    None => {
-                        // 인증 안되서 전파 실패 처리
-                        tracing::error!("인증 안된 세션이라 입장 실패 {}", sid);
-                        let json = serde_json::json!({
-                            "o": PacketKind::EnterRoomFail,
-                            "r": self.room_id,
-                        });
-                        let msg = format!("{}", json);
-                        // 송신자에게만 전파
-                        let _ = tx.send(Ok(Message::Text(msg)));
-                    }
-                }
+        match rooms.get_mut(&self.room_id) {
+            Some(room) => {
+                // 이미 있는 채팅방이면 입장만 처리
+                // 이미 입장되어있는 세션이어도 set 이라 그냥 입장 된것으로 처리 에러 안줌
+                room.insert(sid);
             }
             None => {
-                tracing::error!(
-                    "EnterRoomRequest 실패: 세션 정보에 해당 세션이 없음 {}",
-                    sid
-                );
-                let json = serde_json::json!({
-                    "o": PacketKind::EnterRoomFail,
-                    "s": sid,
-                });
-                let msg = format!("{}", json);
-                // 송신자에게만 전파
-                let _ = tx.send(Ok(Message::Text(msg)));
+                // 채팅방 생성 후 입장 처리
+                rooms.insert(self.room_id.to_owned(), BTreeSet::from([sid]));
             }
         };
+
+        // 인증 된 세션이라 입장 허용
+        let json = serde_json::json!({
+            "o": PacketKind::EnterRoomSuccess,
+            "r": self.room_id,
+        });
+        let msg = format!("{}", json);
+        // 송신자에게만 전파
+        let _ = tx.send(Ok(Message::Text(msg)));
     }
 }
 
@@ -283,49 +295,28 @@ impl LeaveRoomRequest {
     /// 요청 패킷 처리
     pub async fn handle(&self, sid: String, tx: WebsocketTx, state: Arc<AppState>) {
         // 함수가 끝나면 자동 lock 해제
-        let mut sessions = state.sessions.lock().unwrap();
-
-        match sessions.get_mut(&sid) {
-            Some(v) => {
-                match v.user() {
-                    Some(_) => {
-                        // 인증 된 세션이라 퇴장 허용
-                        let json = serde_json::json!({
-                            "o": PacketKind::LeaveRoomSuccess,
-                            "r": self.room_id,
-                        });
-                        let msg = format!("{}", json);
-
-                        v.leave(&self.room_id);
-                        // 송신자에게만 전파
-                        let _ = tx.send(Ok(Message::Text(msg)));
-                    }
-                    None => {
-                        // 인증 안되서 전파 실패 처리
-                        tracing::error!("인증 안된 세션이라 퇴장 실패 {}", sid);
-                        let json = serde_json::json!({
-                            "o": PacketKind::LeaveRoomFail,
-                            "r": self.room_id,
-                        });
-                        let msg = format!("{}", json);
-                        // 송신자에게만 전파
-                        let _ = tx.send(Ok(Message::Text(msg)));
-                    }
-                }
+        let mut rooms = state.rooms.lock().unwrap();
+        match rooms.get_mut(&self.room_id) {
+            Some(room) => {
+                // 채팅방 키에서 세션 아이디 제거
+                room.remove(&sid);
             }
             None => {
-                tracing::error!(
-                    "LeaveRoomRequest 실패: 세션 정보에 해당 세션이 없음 {}",
-                    sid
+                // 존재 하지 않는 채팅방 퇴장을 요청함 근데 그냥 성공 반환
+                tracing::warn!(
+                    "존재 하지 않는 채팅방 퇴장 요청임 근데 그냥 성공 반환 {} {:?}",
+                    sid,
+                    self
                 );
-                let json = serde_json::json!({
-                    "o": PacketKind::LeaveRoomFail,
-                    "s": sid,
-                });
-                let msg = format!("{}", json);
-                // 송신자에게만 전파
-                let _ = tx.send(Ok(Message::Text(msg)));
             }
         };
+
+        let json = serde_json::json!({
+            "o": PacketKind::LeaveRoomSuccess,
+            "r": self.room_id,
+        });
+        let msg = format!("{}", json);
+        // 송신자에게만 전파
+        let _ = tx.send(Ok(Message::Text(msg)));
     }
 }

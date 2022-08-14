@@ -20,8 +20,8 @@ const WS_ENDPOINT: &str = "ws://localhost:3000/websocket";
 pub struct Status(pub i64, pub i64, pub u32);
 
 const CLIENT_COUNT: u64 = 99999;
-const CLIENT_CREATING_PERIOD: u64 = 33;
-const CHAT_CREATING_PERIOD: u64 = 133;
+const CLIENT_CREATING_PERIOD: u64 = 30;
+const CHAT_CREATING_PERIOD: u64 = 1333;
 
 #[tokio::main]
 async fn main() {
