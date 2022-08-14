@@ -3,13 +3,15 @@
 //! connect massive web socket client and broadcast message for benchmarking
 //! `RUST_LOG=info cargo run --example ws_client`
 
+use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use log::{debug, info};
+use rand::{distributions::Uniform, prelude::Distribution};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::time;
+use tokio::time::{self, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const WS_ENDPOINT: &str = "ws://localhost:3000/websocket";
@@ -17,8 +19,9 @@ const WS_ENDPOINT: &str = "ws://localhost:3000/websocket";
 #[derive(Debug)]
 pub struct Status(pub i64, pub i64, pub u32);
 
-const CLIENT_CREATING_PERIOD: u64 = 5;
-const CHAT_CREATING_PERIOD: u64 = 60000;
+const CLIENT_COUNT: u64 = 99999;
+const CLIENT_CREATING_PERIOD: u64 = 33;
+const CHAT_CREATING_PERIOD: u64 = 133;
 
 #[tokio::main]
 async fn main() {
@@ -42,12 +45,22 @@ async fn main() {
     });
     handles.push(show_status);
 
-    for _ in 1..999999 {
+    let mut rng = rand::thread_rng();
+    let random_number: Uniform<i32> = Uniform::from(1..1000);
+
+    for c in 0..CLIENT_COUNT {
+        let enable_send = if c < 100 && random_number.sample(&mut rng) <= 100 {
+            // 클라 100개 미만일시 10프로 확률로 전송 기능 활성화
+            true
+        } else {
+            // 100개 이상이면 1프로로 확률 변경
+            c >= 100 && random_number.sample(&mut rng) <= 10
+        };
         // 0.1 초씩 클라이언트 증가
         time::sleep(Duration::from_millis(CLIENT_CREATING_PERIOD)).await;
         let cloned_status = status.clone();
         let h = tokio::spawn(async move {
-            run_test(cloned_status.clone()).await;
+            run_test(cloned_status.clone(), enable_send).await;
         });
         handles.push(h);
     }
@@ -58,7 +71,7 @@ async fn main() {
     // let a = futures::future::join_all(handles);
 }
 
-pub async fn run_test(status: Arc<Mutex<Status>>) {
+pub async fn run_test(status: Arc<Mutex<Status>>, enable_send: bool) {
     // tasks 수 더하기
     let cloned_status = status.clone();
     cloned_status.lock().unwrap().2 += 1;
@@ -92,20 +105,31 @@ pub async fn run_test(status: Arc<Mutex<Status>>) {
 
     // 0.3초 마다 랜덤 숫자 넣은 채팅 전송
     let cloned_status = status.clone();
+    let stop_watch = Instant::now();
     let send_task = tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_millis(CHAT_CREATING_PERIOD));
+        if !enable_send {
+            // 송신 하는애 아니면 그냥 리턴
+            return;
+        }
         loop {
             interval.tick().await;
-            let msg = format!(
-                r#"{{"o":101, "r":"room_id", "c":"{} 안녕 나는 {} 이야"}}"#,
-                rand::random::<i64>(),
-                rand::random::<i64>()
-            );
-            write.send(Message::from(msg)).await.unwrap();
-            cloned_status.lock().unwrap().1 += 1;
+            let now = Utc::now().naive_utc().timestamp_millis();
+            let millisecond_part = now % 1000;
+            // 현재 밀리세컨드가 300초 이하면 송신 한다 송실한 클라도 랜덤이지만 매 시간마다
+            // 송신 하는 행위도 랜덤으로 하도록 지정
+            if millisecond_part < 333 && stop_watch.elapsed().as_millis() > 2000 {
+                // 2초 이내면 실행 안함 최초 실행을 막고 지정된 interval 대로 메시지 송신 하기 위함
+                let msg = format!(
+                    r#"{{"o":101, "r":"room_id", "c":"{} 안녕 나는 {} 이야"}}"#,
+                    rand::random::<i64>(),
+                    rand::random::<i64>()
+                );
+                write.send(Message::from(msg)).await.unwrap();
+                cloned_status.lock().unwrap().1 += 1;
+            }
         }
     });
-
     recv_task.await.unwrap();
     send_task.await.unwrap();
 }
