@@ -168,7 +168,14 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>, sid: String) {
             let mut users = state.users.lock().unwrap();
             users.remove(&v.user().map(|v| v.id.clone()).unwrap_or_default());
             sessions.remove(&sid);
-            tracing::debug!("{} 세션 제거 완료", sid);
+
+            // 채팅방 전체를 순회해서 해당 세션 ID 삭제
+            // @TODO O(N) 복잡도로 채팅방이 나중에 많아지면 오버헤드가 큼 최적화 필요
+            let mut rooms = state.rooms.lock().unwrap();
+            for session_ids in rooms.values_mut() {
+                session_ids.remove(&sid);
+            }
+            tracing::info!("{} 세션 제거 완료", sid);
         }
         None => {
             tracing::debug!("{} 세선 정보가 없음 그냥 종료", sid);
