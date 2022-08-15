@@ -35,7 +35,10 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::{
+    sync::mpsc::{self, UnboundedSender},
+    time::Instant,
+};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -188,6 +191,7 @@ async fn on_message(state: Arc<AppState>) {
     let redis_subscriber = state.redis_subscriber.clone();
     let mut message_stream = redis_subscriber.on_message();
     while let Some((channel, message)) = message_stream.next().await {
+        let stop_watch = Instant::now();
         let json: serde_json::Value =
             serde_json::from_str(&message.as_str().unwrap_or_default()).unwrap_or_default();
         let room_id = json["r"].as_str().unwrap_or_default();
@@ -216,12 +220,18 @@ async fn on_message(state: Arc<AppState>) {
                 tracing::warn!("on_message 없는 room id 임 그냥 무시 {:?}", message);
             }
         }
+        tracing::info!(
+            "레디스로 부터 받아서 전파 처리시간 {:?} {:?}",
+            stop_watch.elapsed(),
+            message
+        );
     }
 }
 
 async fn on_rx(sid: String, state: Arc<AppState>, ws_tx: WebsocketTx, mut ws_rx: WebsocketRx) {
     while let Some(Ok(message)) = ws_rx.next().await {
         if let Message::Text(payload) = message {
+            let stop_watch = Instant::now();
             let now = Utc::now().naive_utc();
             tracing::debug!("수신 패킷 {}", payload);
             // return statement means close the connection
@@ -297,6 +307,11 @@ async fn on_rx(sid: String, state: Arc<AppState>, ws_tx: WebsocketTx, mut ws_rx:
                     return;
                 }
             };
+            tracing::info!(
+                "수신 처리 완료 처리시간 {:?} {:?}",
+                stop_watch.elapsed(),
+                payload
+            );
         }
     }
 }
