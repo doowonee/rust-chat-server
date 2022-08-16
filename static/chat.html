@@ -61,6 +61,10 @@
             const line = document.createElement('p');
             line.innerText = data;
             chat.appendChild(line);
+            if (chat.childElementCount > 10) {
+                // 10개 이상 채팅 내역이 쌓이면 처음꺼 제거 한다
+                chat.removeChild(chat.children[0])
+            }
         }
 
         send.onclick = function () {
