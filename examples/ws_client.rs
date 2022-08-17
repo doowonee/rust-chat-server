@@ -19,9 +19,9 @@ const WS_ENDPOINT: &str = "ws://localhost:3000/websocket";
 #[derive(Debug)]
 pub struct Status(pub i64, pub i64, pub u32);
 
-const CLIENT_COUNT: u64 = 99999;
-const CLIENT_CREATING_PERIOD: u64 = 30;
-const CHAT_CREATING_PERIOD: u64 = 1333;
+const CLIENT_COUNT: u64 = 10000;
+const CLIENT_CREATING_PERIOD: u64 = 100;
+const CHAT_SENDING_PERIOD: u64 = 20;
 
 #[tokio::main]
 async fn main() {
@@ -37,7 +37,7 @@ async fn main() {
     let cloned_status = status.clone();
 
     let show_status = tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_secs(3));
+        let mut interval = time::interval(Duration::from_secs(1));
         loop {
             interval.tick().await;
             info!("status: {:?}", cloned_status.lock().unwrap(),);
@@ -107,7 +107,7 @@ pub async fn run_test(status: Arc<Mutex<Status>>, enable_send: bool) {
     let cloned_status = status.clone();
     let stop_watch = Instant::now();
     let send_task = tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_millis(CHAT_CREATING_PERIOD));
+        let mut interval = time::interval(Duration::from_millis(CHAT_SENDING_PERIOD));
         if !enable_send {
             // 송신 하는애 아니면 그냥 리턴
             return;

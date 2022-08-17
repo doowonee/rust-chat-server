@@ -31,9 +31,10 @@ use futures::{
 };
 use session::Session;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio::{
     sync::mpsc::{self, UnboundedSender},
@@ -186,42 +187,63 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("../static/chat.html"))
 }
 
+/// 버퍼링 기준 MS
+const BUFFERING_PERIOD_MS: u64 = 50;
+
 /// 레디스로 부터 subscribe 될 때
 async fn on_message(state: Arc<AppState>) {
     let redis_subscriber = state.redis_subscriber.clone();
     let mut message_stream = redis_subscriber.on_message();
+    // redis 로부터 받은 메시지를 임시 저장하는 버퍼
+    let mut msg_buffer: VecDeque<String> = VecDeque::new();
+    let mut last_sent_at = Instant::now();
     while let Some((channel, message)) = message_stream.next().await {
         let stop_watch = Instant::now();
-        let json: serde_json::Value =
-            serde_json::from_str(&message.as_str().unwrap_or_default()).unwrap_or_default();
-        let room_id = json["r"].as_str().unwrap_or_default();
-        tracing::debug!("on_message 수신 {:?} on channel {}", message, channel);
+        // 레디스로 부터 메시지 수신시 일단 메시지 버퍼에 저장
+        let msg = message.as_string().unwrap_or_default();
+        tracing::debug!("on_message 수신 {:?} on channel {}", msg, channel);
+        msg_buffer.push_back(msg);
+        if last_sent_at.elapsed() < Duration::from_millis(BUFFERING_PERIOD_MS) {
+            // 마지막 송신 시간 BUFFERING_PERIOD_MS 미만이면 송신 작업 안함
+            tracing::debug!(
+                "최근 발송 시간 보다 {}ms 미만으로 발송 안함 버퍼링",
+                BUFFERING_PERIOD_MS
+            );
+            continue;
+        }
         let rooms = state.rooms.lock().unwrap();
         let sessions = state.sessions.lock().unwrap();
-        match rooms.get(room_id) {
-            Some(sessions_in_room) => {
-                for session_id in sessions_in_room {
-                    match sessions.get(session_id) {
-                        Some(session) => {
-                            // 해당 세션 웹소켓 송신용 스트림으로 메시지 송신
-                            session.send(message.as_string().unwrap_or_default());
-                        }
-                        None => {
-                            tracing::warn!(
-                                "on_message 없는 세션 {} 송신 못했음 {:?}",
-                                session_id,
-                                message
-                            );
+        // 발송 행위 시작 시간 갱신
+        last_sent_at = Instant::now();
+        // 버퍼에서 앞에서 부터 꺼내와서 송신 작업 처리
+        while let Some(msg) = msg_buffer.pop_front() {
+            let json: serde_json::Value = serde_json::from_str(&msg).unwrap_or_default();
+            let room_id = json["r"].as_str().unwrap_or_default();
+            match rooms.get(room_id) {
+                Some(sessions_in_room) => {
+                    for session_id in sessions_in_room {
+                        match sessions.get(session_id) {
+                            Some(session) => {
+                                // 해당 세션 웹소켓 송신용 스트림으로 메시지 송신
+                                session.send(msg.clone());
+                            }
+                            None => {
+                                tracing::warn!(
+                                    "on_message 없는 세션 {} 송신 못했음 {:?}",
+                                    session_id,
+                                    msg
+                                );
+                            }
                         }
                     }
                 }
-            }
-            None => {
-                tracing::warn!("on_message 없는 room id 임 그냥 무시 {:?}", message);
+                None => {
+                    tracing::warn!("on_message 없는 room id 임 그냥 무시 {:?}", message);
+                }
             }
         }
         tracing::info!(
-            "레디스로 부터 받아서 전파 처리시간 {:?} {:?}",
+            "버퍼 순회해서 전파 처리시간 {:?} {:?}",
             stop_watch.elapsed(),
             message
         );
