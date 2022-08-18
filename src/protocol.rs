@@ -8,12 +8,11 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use axum::extract::ws::Message;
 use chrono::prelude::*;
-use fred::prelude::PubsubInterface;
 use num_enum::TryFromPrimitive;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 
-use crate::{session::User, AppState, WebsocketTx, REDIS_CHANNEL_NAME};
+use crate::{session::User, AppState, WebsocketTx};
 
 /// 프로토콜
 #[derive(Debug, TryFromPrimitive, Serialize_repr, Deserialize_repr)]
@@ -189,21 +188,9 @@ impl SendTextRequest {
                         });
                         let msg = format!("{}", json);
 
-                        // redis publish로 브로드 캐스팅
-                        let redis_client = state.redis_client.clone();
-                        // await를 할수 없어서 task 만들어서 비동기로 레디스에 publish
-                        tokio::spawn(async move {
-                            let received_clients: i64 = redis_client
-                                .publish(REDIS_CHANNEL_NAME, &msg)
-                                .await
-                                .unwrap();
-                            tracing::debug!(
-                                "SendTextRequest 성공 {} {} {}",
-                                received_clients,
-                                sid,
-                                msg
-                            );
-                        });
+                        // redis publish용 mpsc 로 send
+                        tracing::debug!("redis_publish_tx 보냄 {} {}", sid, msg);
+                        let _ = state.redis_publish_tx.send(msg);
                     }
                     None => {
                         // 인증 안되서 전파 실패 처리

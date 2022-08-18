@@ -37,7 +37,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::mpsc::{self, UnboundedSender},
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     time::Instant,
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -57,6 +57,8 @@ pub struct AppState {
     rooms: Mutex<BTreeMap<String, BTreeSet<String>>>,
     redis_client: RedisClient,
     redis_subscriber: SubscriberClient,
+    // redis publish 용 mpsc
+    redis_publish_tx: UnboundedSender<String>,
 }
 
 /// pub sub 대상 채널 이름
@@ -98,6 +100,8 @@ async fn main() {
     let sessions = Mutex::new(BTreeMap::new());
     let users = Mutex::new(BTreeMap::new());
     let rooms = Mutex::new(BTreeMap::new());
+    // redis publish 이벤트 mpsc
+    let (redis_publish_tx, redis_publish_rx) = mpsc::unbounded_channel();
     // 웹 서버 핸들러간 공유
     let app_state = Arc::new(AppState {
         sessions,
@@ -105,10 +109,13 @@ async fn main() {
         rooms,
         redis_client,
         redis_subscriber,
+        redis_publish_tx,
     });
 
     // 웹 소켓 수신 세션별로 subscirbe가 아니라 단일 레디스 수신 핸들러임
-    let _redis_reieve_handler = tokio::spawn(on_message(app_state.clone()));
+    let _redis_subscribe_handler = tokio::spawn(on_message(app_state.clone()));
+    // redis publish 처리 핸들러
+    let _redis_publish_handler = tokio::spawn(on_publish(app_state.clone(), redis_publish_rx));
 
     let app = Router::new()
         .route("/", get(index))
@@ -187,27 +194,34 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("../static/chat.html"))
 }
 
-/// 버퍼링 기준 MS
-const BUFFERING_PERIOD_MS: u64 = 50;
+/// redis subscribe 버퍼링 기준 MS
+const SUBSCRIBE_BUFFERING_PERIOD_MS: u64 = 50;
+/// redis publish 버퍼링 기준 MS
+const PUBLISH_BUFFERING_PERIOD_MS: u64 = 3;
 
 /// 레디스로 부터 subscribe 될 때
 async fn on_message(state: Arc<AppState>) {
     let redis_subscriber = state.redis_subscriber.clone();
     let mut message_stream = redis_subscriber.on_message();
     // redis 로부터 받은 메시지를 임시 저장하는 버퍼
-    let mut msg_buffer: VecDeque<String> = VecDeque::new();
+    let mut msg_buffer: VecDeque<serde_json::Value> = VecDeque::new();
     let mut last_sent_at = Instant::now();
     while let Some((channel, message)) = message_stream.next().await {
         let stop_watch = Instant::now();
         // 레디스로 부터 메시지 수신시 일단 메시지 버퍼에 저장
-        let msg = message.as_string().unwrap_or_default();
+        // 메시지는 1건이 아니라 리스트 형식으로 들어올것임
+        let msg = message.as_str().unwrap_or_default();
+        let messages: Vec<serde_json::Value> = serde_json::from_str(&msg).unwrap_or_default();
         tracing::debug!("on_message 수신 {:?} on channel {}", msg, channel);
-        msg_buffer.push_back(msg);
-        if last_sent_at.elapsed() < Duration::from_millis(BUFFERING_PERIOD_MS) {
+        messages
+            .into_iter()
+            .for_each(|json| msg_buffer.push_back(json));
+
+        if last_sent_at.elapsed() < Duration::from_millis(SUBSCRIBE_BUFFERING_PERIOD_MS) {
             // 마지막 송신 시간 BUFFERING_PERIOD_MS 미만이면 송신 작업 안함
             tracing::debug!(
                 "최근 발송 시간 보다 {}ms 미만으로 발송 안함 버퍼링",
-                BUFFERING_PERIOD_MS
+                SUBSCRIBE_BUFFERING_PERIOD_MS
             );
             continue;
         }
@@ -216,8 +230,8 @@ async fn on_message(state: Arc<AppState>) {
         // 발송 행위 시작 시간 갱신
         last_sent_at = Instant::now();
         // 버퍼에서 앞에서 부터 꺼내와서 송신 작업 처리
-        while let Some(msg) = msg_buffer.pop_front() {
-            let json: serde_json::Value = serde_json::from_str(&msg).unwrap_or_default();
+        while let Some(json) = msg_buffer.pop_front() {
+            let msg = json.to_string();
             let room_id = json["r"].as_str().unwrap_or_default();
             match rooms.get(room_id) {
                 Some(sessions_in_room) => {
@@ -229,7 +243,7 @@ async fn on_message(state: Arc<AppState>) {
                             }
                             None => {
                                 tracing::warn!(
-                                    "on_message 없는 세션 {} 송신 못했음 {:?}",
+                                    "on_message 없는 세션 {} 송신 못했음 {}",
                                     session_id,
                                     msg
                                 );
@@ -238,7 +252,7 @@ async fn on_message(state: Arc<AppState>) {
                     }
                 }
                 None => {
-                    tracing::warn!("on_message 없는 room id 임 그냥 무시 {:?}", message);
+                    tracing::warn!("on_message 없는 room id 임 그냥 무시 {}", msg);
                 }
             }
         }
@@ -247,6 +261,50 @@ async fn on_message(state: Arc<AppState>) {
             stop_watch.elapsed(),
             message
         );
+    }
+}
+
+/// 레디스로 publish 되어야 할때
+async fn on_publish(state: Arc<AppState>, mut redis_publish_rx: UnboundedReceiver<String>) {
+    // redis로 publish 할 메시지를 임시 저장하는 버퍼
+    let mut msg_buffer: VecDeque<String> = VecDeque::new();
+    let mut last_publish_at = Instant::now();
+    while let Some(msg) = redis_publish_rx.recv().await {
+        let stop_watch = Instant::now();
+        // mpsc 수신시 일단 메시지 버퍼에 저장
+        tracing::debug!("on_publish 수신 {}", msg);
+        msg_buffer.push_back(msg);
+
+        if last_publish_at.elapsed() < Duration::from_millis(PUBLISH_BUFFERING_PERIOD_MS) {
+            // 마지막 송신 시간 BUFFERING_PERIOD_MS 미만이면 송신 작업 안함
+            tracing::debug!(
+                "최근 PUBLISH 시간 보다 {}ms 미만으로 발송 안함 버퍼링",
+                PUBLISH_BUFFERING_PERIOD_MS
+            );
+            continue;
+        }
+        // 발송 행위 시작 시간 갱신
+        last_publish_at = Instant::now();
+        // 버퍼에서 앞에서 부터 꺼내와서 한번에 보내기위해 JSON 배열을 준비 한다
+        let mut messages: serde_json::Value = serde_json::json!([]);
+        while let Some(msg) = msg_buffer.pop_front() {
+            messages
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::from_str(&msg).unwrap_or_default());
+        }
+        let redis_client = state.redis_client.clone();
+        // await를 할수 없어서 task 만들어서 비동기로 레디스에 publish
+        // JSON 배열을 한번에 1건으로 publish 한다
+        tokio::spawn(async move {
+            let received_clients: i64 = redis_client
+                .publish(REDIS_CHANNEL_NAME, messages.to_string())
+                .await
+                .unwrap();
+            tracing::debug!("redis publish 완료 {} {}", received_clients, messages);
+        });
+
+        tracing::info!("버퍼 순회해서 PUBLISH 완료 시간 {:?}", stop_watch.elapsed(),);
     }
 }
 
