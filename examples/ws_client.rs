@@ -17,11 +17,11 @@ const WS_ENDPOINT: &str = "ws://localhost:3000/websocket";
 #[derive(Debug)]
 pub struct Status(pub i64, pub i64, pub u32);
 
-const CLIENT_COUNT: u64 = 180;
+const CLIENT_COUNT: u64 = 5000;
 const CLIENT_CREATING_PERIOD: u64 = 100;
 const CHAT_SENDING_RATE: u64 = 20;
 // u16 범위 숫자 기준 이 숫자 보다 높으면 송신 안함 대략 6500이면 10프로 확률로 발송하는거임
-const CHAT_SENDING_POSSIBILITY: u16 = 25500;
+const CHAT_SENDING_POSSIBILITY: u16 = 22500;
 
 #[tokio::main]
 async fn main() {

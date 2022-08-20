@@ -20,11 +20,6 @@ use axum::{
     Error, Router,
 };
 use chrono::prelude::*;
-use fred::{
-    clients::SubscriberClient,
-    prelude::*,
-    types::{ReconnectPolicy, RedisConfig},
-};
 use futures::{
     stream::{SplitStream, StreamExt},
     FutureExt,
@@ -55,10 +50,10 @@ pub struct AppState {
     users: Mutex<BTreeMap<String, String>>,
     /// 채팅방 아이디를 키로하고 세션 아디 셋을 값으로 하는 트리맵
     rooms: Mutex<BTreeMap<String, BTreeSet<String>>>,
-    redis_client: RedisClient,
-    redis_subscriber: SubscriberClient,
     // redis publish 용 mpsc
     redis_publish_tx: UnboundedSender<String>,
+    // redis publish 용 mpsc
+    redis_subscribe_tx: UnboundedSender<String>,
 }
 
 /// pub sub 대상 채널 이름
@@ -78,42 +73,25 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Redis 클라이언트 준비
-    let config = RedisConfig::default();
-    let policy = ReconnectPolicy::default();
-    let redis_client = RedisClient::new(config.clone());
-    // connect to the server, returning a handle to the task that drives the connection
-    let _ = redis_client.connect(Some(policy.clone()));
-    let _ = redis_client.wait_for_connect().await.unwrap();
-
-    // fred SubscriberClient 사용해서 redis subscribe 자동 재연결 처리
-    let redis_subscriber = SubscriberClient::new(config);
-    let _ = redis_subscriber.connect(Some(policy));
-    let _ = redis_subscriber.wait_for_connect().await.unwrap();
-    let _ = redis_subscriber.manage_subscriptions();
-    let _ = redis_subscriber
-        .subscribe(REDIS_CHANNEL_NAME)
-        .await
-        .unwrap();
-    tracing::info!("redis subscribe 완료");
-
     let sessions = Mutex::new(BTreeMap::new());
     let users = Mutex::new(BTreeMap::new());
     let rooms = Mutex::new(BTreeMap::new());
     // redis publish 이벤트 mpsc
     let (redis_publish_tx, redis_publish_rx) = mpsc::unbounded_channel();
+
+    // redis subscribe 이벤트 mpsc
+    let (redis_subscribe_tx, redis_subscribe_rx) = mpsc::unbounded_channel();
     // 웹 서버 핸들러간 공유
     let app_state = Arc::new(AppState {
         sessions,
         users,
         rooms,
-        redis_client,
-        redis_subscriber,
         redis_publish_tx,
+        redis_subscribe_tx,
     });
 
     // 웹 소켓 수신 세션별로 subscirbe가 아니라 단일 레디스 수신 핸들러임
-    let _redis_subscribe_handler = tokio::spawn(on_message(app_state.clone()));
+    let _redis_subscribe_handler = tokio::spawn(on_message(app_state.clone(), redis_subscribe_rx));
     // redis publish 처리 핸들러
     let _redis_publish_handler = tokio::spawn(on_publish(app_state.clone(), redis_publish_rx));
 
@@ -200,19 +178,16 @@ const SUBSCRIBE_BUFFERING_PERIOD_MS: u64 = 50;
 const PUBLISH_BUFFERING_PERIOD_MS: u64 = 3;
 
 /// 레디스로 부터 subscribe 될 때
-async fn on_message(state: Arc<AppState>) {
-    let redis_subscriber = state.redis_subscriber.clone();
-    let mut message_stream = redis_subscriber.on_message();
+async fn on_message(state: Arc<AppState>, mut redis_subscribe_rx: UnboundedReceiver<String>) {
     // redis 로부터 받은 메시지를 임시 저장하는 버퍼
     let mut msg_buffer: VecDeque<serde_json::Value> = VecDeque::new();
     let mut last_sent_at = Instant::now();
-    while let Some((channel, message)) = message_stream.next().await {
+    while let Some(message) = redis_subscribe_rx.recv().await {
         let stop_watch = Instant::now();
         // 레디스로 부터 메시지 수신시 일단 메시지 버퍼에 저장
         // 메시지는 1건이 아니라 리스트 형식으로 들어올것임
-        let msg = message.as_str().unwrap_or_default();
-        let messages: Vec<serde_json::Value> = serde_json::from_str(&msg).unwrap_or_default();
-        tracing::debug!("on_message 수신 {:?} on channel {}", msg, channel);
+        let messages: Vec<serde_json::Value> = serde_json::from_str(&message).unwrap_or_default();
+        tracing::debug!("on_message 수신 {}", message);
         messages
             .into_iter()
             .for_each(|json| msg_buffer.push_back(json));
@@ -293,17 +268,7 @@ async fn on_publish(state: Arc<AppState>, mut redis_publish_rx: UnboundedReceive
                 .unwrap()
                 .push(serde_json::from_str(&msg).unwrap_or_default());
         }
-        let redis_client = state.redis_client.clone();
-        // await를 할수 없어서 task 만들어서 비동기로 레디스에 publish
-        // JSON 배열을 한번에 1건으로 publish 한다
-        tokio::spawn(async move {
-            let received_clients: i64 = redis_client
-                .publish(REDIS_CHANNEL_NAME, messages.to_string())
-                .await
-                .unwrap();
-            tracing::debug!("redis publish 완료 {} {}", received_clients, messages);
-        });
-
+        state.redis_subscribe_tx.send(messages.to_string()).unwrap();
         tracing::info!("버퍼 순회해서 PUBLISH 완료 시간 {:?}", stop_watch.elapsed(),);
     }
 }
